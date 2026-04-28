@@ -83,10 +83,22 @@ class App(ctk.CTk):
         self.samples_count: int = 0
         self.matrix_data: Any = None
         self._home_selection_patch: Any = None
+        self._home_selection_patches: list[Any] = []
+        self._home_selected_ranges: list[tuple[int, int]] = []
         self._home_drag_anchor: Optional[int] = None
+        self._home_ctrl_down: bool = False
         self._home_view_start: int = 0
         self._home_view_end: int = 0
         self._home_view_step: int = 1
+        self._home_window_size: int = 500
+        self._home_window_request_id: int = 0
+        self._home_window_cancel: Optional[threading.Event] = None
+        self._home_window_after: Optional[str] = None
+        self._home_window_start: int = 0
+        self._home_window_last: Optional[tuple[int, int]] = None
+        self._home_slider: Any = None
+        self._home_slider_label: Any = None
+        self.home_slider_status: Any = None
         self._plot_popups: dict[str, Any] = {}
         self._data_read_request_id: int = 0
         self._data_read_cancel: Optional[threading.Event] = None
@@ -209,6 +221,7 @@ class App(ctk.CTk):
         self.update_idletasks()
         self._bind_global_shortcuts()
         self._bind_upload_double_click()
+        self._bind_ctrl_for_multiselect()
 
         self.protocol("WM_DELETE_WINDOW", self._on_close_request)
         self._schedule_ui_drain()
@@ -279,7 +292,8 @@ class App(ctk.CTk):
                 self.samples_count = int(r.samples_count or 0)
                 self.matrix_data = None
                 self._sync_data_tab_after_load()
-                self._update_home_plots_after_load(r.preview)
+                self._sync_home_slider_after_load()
+                self._request_home_window_read(0, force=True)
             elif r.error == "bad_ext":
                 self.current_file_path = None
                 self.file_status.configure(
@@ -305,16 +319,29 @@ class App(ctk.CTk):
                 self._reset_data_tab_state()
                 self._reset_home_plots_empty()
         elif isinstance(msg, UiMessageReadDataProgress):
+            if msg.request_id == self._home_window_request_id:
+                pct = int(100 * msg.processed / max(1, msg.total))
+                try:
+                    if self.home_slider_status is not None:
+                        self.home_slider_status.configure(text=f"Чтение окна: {pct}%")
+                except Exception:
+                    pass
+                return
             if msg.request_id != self._data_read_request_id:
                 return
             pct = int(100 * msg.processed / max(1, msg.total))
             self.label_data_result.configure(text=f"Чтение данных: {pct}%", text_color=C.STATUS_PENDING)
         elif isinstance(msg, UiMessageReadDataResult):
-            if msg.request_id != self._data_read_request_id:
+            if msg.request_id == self._data_read_request_id:
+                self._set_data_read_busy(False)
+                self._data_read_cancel = None
+                self._apply_data_read_result(msg)
                 return
-            self._set_data_read_busy(False)
-            self._data_read_cancel = None
-            self._apply_data_read_result(msg)
+            if msg.request_id == self._home_window_request_id:
+                self._home_window_cancel = None
+                self._apply_home_window_read_result(msg)
+                return
+            return
         elif isinstance(msg, UiMessageProcessProgress):
             if msg.request_id != self._process_request_id:
                 return
@@ -369,6 +396,15 @@ class App(ctk.CTk):
                 self._data_read_cancel = None
                 self.matrix_data = None
                 self.label_data_result.configure(text=msg.message, text_color=C.STATUS_WARN)
+                return
+            if msg.request_id == self._home_window_request_id:
+                self._home_window_cancel = None
+                if getattr(self, "_home_matplotlib_ok", False) and self._home_ax_before is not None:
+                    self._home_apply_placeholder(self._home_ax_before, msg.message)
+                    try:
+                        self._home_canvas_before.draw()
+                    except Exception:
+                        pass
                 return
             if msg.request_id == self._process_request_id:
                 self.btn_processing_cancel.configure(state="disabled")
@@ -493,6 +529,18 @@ class App(ctk.CTk):
             self.save_state("Файл")
         self.open_file_dialog()
         return "break"
+
+    def _bind_ctrl_for_multiselect(self) -> None:
+        def down(_e=None):
+            self._home_ctrl_down = True
+
+        def up(_e=None):
+            self._home_ctrl_down = False
+
+        self.bind_all("<KeyPress-Control_L>", down, add="+")
+        self.bind_all("<KeyRelease-Control_L>", up, add="+")
+        self.bind_all("<KeyPress-Control_R>", down, add="+")
+        self.bind_all("<KeyRelease-Control_R>", up, add="+")
 
     def _bind_upload_double_click(self) -> None:
         def on_double(event) -> str:
@@ -1466,7 +1514,7 @@ class App(ctk.CTk):
         self._set_entry_int(self.entry_data_start, start)
         self._set_entry_int(self.entry_data_end, end)
         self._set_entry_int(self.entry_data_step, step)
-        self._draw_home_selection_overlay(start, end)
+        # Ручной ввод диапазона (вкладка «Анализ») не должен менять график «Главная».
 
     def _on_data_entries_focus_out(self, _event=None) -> None:
         self._sync_data_entries_from_inputs()
@@ -1476,42 +1524,52 @@ class App(ctk.CTk):
             return None
         try:
             x = float(x_value)
-            x0, x1 = self._home_ax_before.get_xlim()
-            if x1 == x0:
+            if self._home_view_end <= self._home_view_start:
                 return None
-            ratio = (x - x0) / (x1 - x0)
-            view_count = len(range(self._home_view_start, self._home_view_end, self._home_view_step))
-            if view_count <= 0:
-                return None
-            local_idx = int(round(ratio * (view_count - 1)))
-            local_idx = max(0, min(view_count - 1, local_idx))
-            trace = self._home_view_start + local_idx * self._home_view_step
+            step = max(1, int(self._home_view_step or 1))
+            # Ось X выровнена так, что центр каждой трассы находится в целой координате.
+            idx = int(round((x - float(self._home_view_start)) / float(step)))
+            trace = int(self._home_view_start + idx * step)
         except Exception:
             return None
+        left = int(self._home_view_start)
+        right = int(self._home_view_end) - 1
+        if right < left:
+            return None
+        trace = max(left, min(right, trace))
         return max(0, min(self.total_traces - 1, trace))
 
     def _draw_home_selection_overlay(self, start: int, end: int) -> None:
         if not getattr(self, "_home_matplotlib_ok", False) or self.total_traces <= 0:
             return
         ax = self._home_ax_before
+        for p in list(self._home_selection_patches):
+            try:
+                p.remove()
+            except Exception:
+                pass
+        self._home_selection_patches.clear()
         if self._home_selection_patch is not None:
             try:
                 self._home_selection_patch.remove()
             except Exception:
                 pass
-        x0, x1 = ax.get_xlim()
-        if x1 == x0:
+        if self._home_view_end <= self._home_view_start:
             return
-        view_count = len(range(self._home_view_start, self._home_view_end, self._home_view_step))
-        if view_count <= 0:
-            return
-        left_idx = (start - self._home_view_start) / max(1, self._home_view_step)
-        right_idx = (end - self._home_view_start) / max(1, self._home_view_step)
-        left_idx = max(0.0, min(float(view_count - 1), float(left_idx)))
-        right_idx = max(0.0, min(float(view_count), float(right_idx)))
-        left = x0 + (left_idx / max(1, view_count - 1)) * (x1 - x0)
-        right = x0 + (right_idx / max(1, view_count - 1)) * (x1 - x0)
-        self._home_selection_patch = ax.axvspan(min(left, right), max(left, right), color=str(C.ACCENT), alpha=0.25)
+        step = max(1, int(self._home_view_step or 1))
+        ranges = self._home_selected_ranges[:] if self._home_selected_ranges else [(int(start), int(end))]
+        for rs, re in ranges:
+            left_trace = max(int(self._home_view_start), int(rs))
+            right_trace_excl = min(int(self._home_view_end), int(re))
+            if right_trace_excl <= left_trace:
+                right_trace_excl = left_trace + step
+            left = float(left_trace) - 0.5 * float(step)
+            right = float(right_trace_excl) - 0.5 * float(step)
+            self._home_selection_patches.append(
+                ax.axvspan(min(left, right), max(left, right), color=str(C.ACCENT), alpha=0.25)
+            )
+        if self._home_selection_patches:
+            self._home_selection_patch = self._home_selection_patches[-1]
         self._home_canvas_before.draw_idle()
 
     def _on_home_before_press(self, event) -> None:
@@ -1547,9 +1605,26 @@ class App(ctk.CTk):
         right = min(self._home_view_end - 1, right)
         if right < left:
             right = left
-        self._set_entry_int(self.entry_data_start, left)
-        self._set_entry_int(self.entry_data_end, min(self.total_traces, right + 1))
-        self._draw_home_selection_overlay(left, min(self.total_traces, right + 1))
+        rng = (int(left), int(min(self.total_traces, right + 1)))
+        if self._home_ctrl_down:
+            self._home_selected_ranges.append(rng)
+            self._home_selected_ranges.sort(key=lambda x: x[0])
+            merged: list[tuple[int, int]] = []
+            for s, e in self._home_selected_ranges:
+                if not merged:
+                    merged.append((s, e))
+                    continue
+                ps, pe = merged[-1]
+                if s <= pe:
+                    merged[-1] = (ps, max(pe, e))
+                else:
+                    merged.append((s, e))
+            self._home_selected_ranges = merged
+        else:
+            self._home_selected_ranges = [rng]
+        self._set_entry_int(self.entry_data_start, rng[0])
+        self._set_entry_int(self.entry_data_end, rng[1])
+        self._draw_home_selection_overlay(rng[0], rng[1])
 
     def _sync_data_tab_after_load(self) -> None:
         for e in (self.entry_data_start, self.entry_data_end, self.entry_data_step):
@@ -1607,6 +1682,174 @@ class App(ctk.CTk):
         self._home_view_start = 0
         self._home_view_end = 0
         self._home_view_step = 1
+        self._home_selected_ranges = []
+        self._home_selection_patches = []
+        if self._home_window_cancel is not None:
+            try:
+                self._home_window_cancel.set()
+            except Exception:
+                pass
+        self._home_window_cancel = None
+        self._home_window_last = None
+        if self._home_window_after is not None:
+            try:
+                self.after_cancel(self._home_window_after)
+            except Exception:
+                pass
+        self._home_window_after = None
+        try:
+            if self._home_slider is not None:
+                self._home_slider.configure(state="disabled", from_=0, to=0, number_of_steps=0)
+        except Exception:
+            pass
+        try:
+            if self._home_slider_label is not None:
+                self._home_slider_label.configure(text="Окно: —")
+        except Exception:
+            pass
+        try:
+            if self.home_slider_status is not None:
+                self.home_slider_status.configure(text="")
+        except Exception:
+            pass
+
+    def _sync_home_slider_after_load(self) -> None:
+        if not self.current_file_path or self.total_traces <= 0:
+            return
+        max_start = max(0, int(self.total_traces) - int(self._home_window_size))
+        steps = max(1, min(max_start, 5000))
+        try:
+            if self._home_slider is not None:
+                self._home_slider.configure(from_=0, to=max_start, number_of_steps=steps, state="normal")
+                self._home_slider.set(0)
+        except Exception:
+            pass
+        try:
+            if self._home_slider_label is not None:
+                end = min(self.total_traces, self._home_window_size) - 1
+                self._home_slider_label.configure(text=f"0…{max(0, end)}")
+        except Exception:
+            pass
+        try:
+            if self.home_slider_status is not None:
+                self.home_slider_status.configure(text="")
+        except Exception:
+            pass
+
+    def _on_home_slider_changed(self, value: float) -> None:
+        """Debounce: не читать файл на каждом шаге перетаскивания."""
+        if not self.current_file_path or self.total_traces <= 0:
+            return
+        try:
+            start = int(round(float(value)))
+        except Exception:
+            start = 0
+        max_start = max(0, int(self.total_traces) - int(self._home_window_size))
+        start = max(0, min(max_start, start))
+        self._home_window_start = start
+        try:
+            if self._home_slider_label is not None:
+                end = min(self.total_traces, start + self._home_window_size) - 1
+                self._home_slider_label.configure(text=f"{start}…{max(start, end)}")
+        except Exception:
+            pass
+        if self._home_window_after is not None:
+            try:
+                self.after_cancel(self._home_window_after)
+            except Exception:
+                pass
+            self._home_window_after = None
+        self._home_window_after = self.after(180, lambda: self._request_home_window_read(start))
+
+    def _request_home_window_read(self, start: int, *, force: bool = False) -> None:
+        if not self.current_file_path or self.total_traces <= 0:
+            return
+        window = int(self._home_window_size)
+        if window <= 0:
+            return
+
+        # Если трасс >= 500 — всегда показываем ровно 500 и не "сжимаем" окно у конца файла.
+        if int(self.total_traces) >= window:
+            max_start = int(self.total_traces) - window
+            start = int(max(0, min(int(start), max_start)))
+            end = int(start + window)
+        else:
+            # Иначе показываем всё, что есть (меньше 500 физически не получить).
+            start = 0
+            end = int(self.total_traces)
+            if end <= 0:
+                return
+        if not force and self._home_window_last == (start, end):
+            return
+        self._home_window_last = (start, end)
+
+        ev = self._home_window_cancel
+        if ev is not None:
+            try:
+                ev.set()
+            except Exception:
+                pass
+        cancel_event = threading.Event()
+        self._home_window_cancel = cancel_event
+
+        self._home_window_request_id += 1
+        req_id = self._home_window_request_id
+
+        # Область видимости для выбора мышью — только текущее окно.
+        self._home_view_start = start
+        self._home_view_end = end
+        self._home_view_step = 1
+
+        try:
+            self._set_entry_int(self.entry_data_start, start)
+            self._set_entry_int(self.entry_data_end, end)
+            self._set_entry_int(self.entry_data_step, 1)
+        except Exception:
+            pass
+
+        try:
+            if self._home_slider_label is not None:
+                self._home_slider_label.configure(text=f"{start}…{max(start, end - 1)}")
+        except Exception:
+            pass
+        try:
+            if self.home_slider_status is not None:
+                self.home_slider_status.configure(text="Чтение окна: 0%")
+        except Exception:
+            pass
+
+        self._logic_queue.put(
+            LogicTaskReadDataRange(
+                path=self.current_file_path,
+                request_id=req_id,
+                start=start,
+                end=end,
+                step=1,
+                chunk_size=2000,
+                max_full_matrix_bytes=256 * 1024 * 1024,
+                preview_target=int(self._home_window_size),
+                cancel_event=cancel_event,
+            )
+        )
+
+    def _apply_home_window_read_result(self, msg: UiMessageReadDataResult) -> None:
+        try:
+            if self.home_slider_status is not None:
+                self.home_slider_status.configure(text="")
+        except Exception:
+            pass
+        self._home_view_start = int(msg.start)
+        self._home_view_end = int(msg.end)
+        self._home_view_step = int(max(1, msg.step))
+
+        plot_matrix = msg.full_matrix if msg.keep_full_matrix and msg.full_matrix is not None else msg.preview_matrix
+        if plot_matrix is None:
+            return
+        self._update_home_before_from_matrix(plot_matrix)
+        try:
+            self._draw_home_selection_overlay(int(msg.start), int(msg.end))
+        except Exception:
+            pass
 
     def _on_data_read_to_memory(self) -> None:
         if not self.current_file_path or self.total_traces <= 0:
@@ -1651,14 +1894,10 @@ class App(ctk.CTk):
         cached = self._data_range_cache.get(cache_key)
         if cached is not None:
             self.matrix_data = cached["full_matrix"]
-            self._home_view_start = start
-            self._home_view_end = end
-            self._home_view_step = step
             self.label_data_result.configure(
                 text=cached["message"] + " (из кэша)",
                 text_color=C.STATUS_OK,
             )
-            self._draw_home_selection_overlay(start, end)
             self._open_plot_popup(
                 key="before",
                 title="График До",
@@ -1702,11 +1941,8 @@ class App(ctk.CTk):
         )
         self.matrix_data = msg.full_matrix
         plot_matrix = msg.full_matrix if msg.keep_full_matrix and msg.full_matrix is not None else msg.preview_matrix
-        self._home_view_start = msg.start
-        self._home_view_end = msg.end
-        self._home_view_step = msg.step
         self.label_data_result.configure(text=text, text_color=C.STATUS_OK)
-        self._draw_home_selection_overlay(msg.start, msg.end)
+        # Важно: чтение диапазона для «Анализ» не должно менять окно/график «Главная».
         self._open_plot_popup(
             key="before",
             title="График До",
@@ -1777,8 +2013,9 @@ class App(ctk.CTk):
         norm = np.clip(arr / p98, -1.0, 1.0)
 
         mode = str(self.current_state.get("plot_mode", C.PLOT_MODE_IMAGE) or C.PLOT_MODE_IMAGE)
-        x0 = float(trace_start)
-        x1 = float(trace_start + trace_step * norm.shape[0])
+        # Выравниваем геометрию оси X: центры трасс на целых значениях.
+        x0 = float(trace_start) - 0.5 * float(trace_step)
+        x1 = float(trace_start + trace_step * norm.shape[0]) - 0.5 * float(trace_step)
 
         if mode == C.PLOT_MODE_IMAGE:
             cmap = "gray"
@@ -1799,7 +2036,7 @@ class App(ctk.CTk):
             )
             return
 
-        max_traces = 220
+        max_traces = 500
         ntr = int(norm.shape[0])
         step_idx = max(1, int(ntr // max_traces))
         tr_idx = np.arange(0, ntr, step_idx, dtype=int)
@@ -1897,9 +2134,54 @@ class App(ctk.CTk):
         outer = ctk.CTkFrame(f, fg_color="transparent")
         outer.pack(fill="both", expand=True, padx=10, pady=10)
         outer.grid_columnconfigure(0, weight=1, uniform="home")
+        # Ряд 0 — график (растягивается), ряд 1 — бегунок снизу
         outer.grid_rowconfigure(0, weight=1)
+        outer.grid_rowconfigure(1, weight=0)
 
-        def pane(col: int, title: str, pad_l: int, pad_r: int) -> ctk.CTkFrame:
+        controls = ctk.CTkFrame(outer, fg_color="transparent")
+        controls.grid(row=1, column=0, sticky="ew", padx=2, pady=(8, 0))
+        controls.grid_columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(
+            controls,
+            text="Окно 500 трасс:",
+            font=C.FONT_BODY,
+            text_color=C.GRAY_TEXT,
+            anchor="w",
+        ).grid(row=0, column=0, sticky="w", padx=(6, 10))
+
+        self._home_slider = ctk.CTkSlider(
+            controls,
+            from_=0,
+            to=0,
+            number_of_steps=1,
+            command=self._on_home_slider_changed,
+        )
+        self._home_slider.grid(row=0, column=1, sticky="ew", padx=(0, 10))
+        try:
+            self._home_slider.configure(state="disabled")
+        except Exception:
+            pass
+
+        self._home_slider_label = ctk.CTkLabel(
+            controls,
+            text="Окно: —",
+            font=C.FONT_BODY,
+            text_color=C.GRAY_TEXT,
+            width=140,
+            anchor="e",
+        )
+        self._home_slider_label.grid(row=0, column=2, sticky="e", padx=(0, 6))
+        self.home_slider_status = ctk.CTkLabel(
+            controls,
+            text="",
+            font=C.FONT_SMALL,
+            text_color=C.GRAY_TEXT_MUTED,
+            anchor="w",
+        )
+        self.home_slider_status.grid(row=1, column=0, columnspan=3, sticky="ew", padx=6, pady=(2, 0))
+
+        def pane(row: int, col: int, title: str, pad_l: int, pad_r: int) -> ctk.CTkFrame:
             box = ctk.CTkFrame(
                 outer,
                 fg_color=C.PIPELINE_CARD_FG,
@@ -1907,7 +2189,7 @@ class App(ctk.CTk):
                 border_width=1,
                 border_color=C.PIPELINE_CARD_BORDER,
             )
-            box.grid(row=0, column=col, sticky="nsew", padx=(pad_l, pad_r))
+            box.grid(row=row, column=col, sticky="nsew", padx=(pad_l, pad_r))
             box.grid_rowconfigure(1, weight=1)
             box.grid_columnconfigure(0, weight=1)
             ctk.CTkLabel(
@@ -1921,7 +2203,7 @@ class App(ctk.CTk):
             host.grid(row=1, column=0, sticky="nsew", padx=10, pady=(0, 10))
             return host
 
-        self._home_plot_host_before = pane(0, "Исходные данные", 0, 0)
+        self._home_plot_host_before = pane(0, 0, "Исходные данные", 0, 0)
         self._home_matplotlib_ok = False
         self._home_fig_before = None
         self._home_ax_before = None
@@ -1990,26 +2272,21 @@ class App(ctk.CTk):
             return
         self._home_apply_placeholder(self._home_ax_before, "Загрузите файл на вкладке «Файл».")
         self._home_selection_patch = None
+        self._home_selected_ranges = []
+        self._home_selection_patches = []
         self._home_canvas_before.draw()
         self.after(50, self._home_refresh_matplotlib_geometry)
 
     def _update_home_plots_after_load(self, preview: Optional[SeismicPreview]) -> None:
         if not getattr(self, "_home_matplotlib_ok", False):
             return
-        if preview is None and self.current_file_path:
-            try:
-                from logic.seismic import load_segy_preview
-
-                preview = load_segy_preview(self.current_file_path)
-            except Exception:
-                preview = None
         axb = self._home_ax_before
         axb.clear()
         axb.axis("on")
         if preview is None:
             self._home_apply_placeholder(
                 axb,
-                "Файл принят, но превью SEG-Y недоступно\n(установите segyio/numpy или проверьте файл).",
+                "Файл подключён. Двигайте бегунок снизу,\nчтобы подгрузить и отобразить 500 трасс.",
             )
         else:
             import numpy as np
@@ -2078,6 +2355,8 @@ class App(ctk.CTk):
             self._save_undo_state()
             self.current_file_path = None
             self.file_status.configure(text="Файл не выбран", text_color="gray")
+            self._reset_data_tab_state()
+            self._reset_home_plots_empty()
             self.analysis_pipeline = []
             self._refresh_analysis_ui()
             for child in self.analysis_workspace_canvas.winfo_children():

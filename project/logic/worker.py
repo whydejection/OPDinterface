@@ -20,7 +20,6 @@ from models import (
 )
 
 from .seismic import (
-    load_segy_preview,
     process_range_streaming,
     read_data_range_streaming,
     read_segy_meta,
@@ -41,7 +40,6 @@ def logic_worker_main(task_queue: queue.Queue, ui_queue: queue.Queue) -> None:
             try:
                 result = validate_seismic_file(task.path)
                 if result.ok and result.path:
-                    preview = load_segy_preview(result.path)
                     meta = read_segy_meta(result.path)
                     tc = meta[0] if meta else None
                     sc = meta[1] if meta else None
@@ -49,7 +47,7 @@ def logic_worker_main(task_queue: queue.Queue, ui_queue: queue.Queue) -> None:
                         ok=True,
                         name=result.name,
                         path=result.path,
-                        preview=preview,
+                        preview=None,
                         tracecount=tc,
                         samples_count=sc,
                     )
