@@ -10,6 +10,9 @@ from typing import Optional
 from models import SeismicPreview, ValidationResult
 
 LOG = logging.getLogger(__name__)
+_INTERP_SESSION = None
+_INTERP_IO_NAMES: Optional[tuple[str, str]] = None
+_INTERP_UNAVAILABLE = False
 
 
 def _segyio_path(path: str) -> str:
@@ -28,6 +31,99 @@ def _segyio_path(path: str) -> str:
     except Exception:
         pass
     return path
+
+
+def _ensure_interp_session():
+    """Ленивая инициализация ONNX-модели интерполяции."""
+    global _INTERP_SESSION, _INTERP_IO_NAMES, _INTERP_UNAVAILABLE
+    if _INTERP_UNAVAILABLE:
+        return None
+    if _INTERP_SESSION is not None:
+        return _INTERP_SESSION
+    try:
+        import onnxruntime as ort
+    except Exception:
+        LOG.warning("onnxruntime недоступен — метод interp работает как passthrough")
+        _INTERP_UNAVAILABLE = True
+        return None
+
+    # Поиск модели без привязки к конкретному ПК/пользователю.
+    env_model = (os.environ.get("OPD_INTERP_MODEL") or "").strip()
+    base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    candidates = []
+    if env_model:
+        candidates.append(env_model)
+    candidates.extend(
+        [
+            os.path.join(base_dir, "models", "swin_transformer.onnx"),
+            os.path.join(base_dir, "Методы", "swin_transformer.onnx"),
+            os.path.join(base_dir, "methods", "swin_transformer.onnx"),
+            os.path.join(os.getcwd(), "models", "swin_transformer.onnx"),
+            os.path.join(os.getcwd(), "Методы", "swin_transformer.onnx"),
+            os.path.join(os.getcwd(), "methods", "swin_transformer.onnx"),
+        ]
+    )
+    model_path = ""
+    for cand in candidates:
+        p = os.path.abspath(os.path.normpath(cand))
+        if os.path.isfile(p):
+            model_path = p
+            break
+    model_path = _segyio_path(model_path) if model_path else ""
+    if not os.path.isfile(model_path):
+        LOG.warning(
+            "Файл модели интерполяции не найден. Ищем через OPD_INTERP_MODEL "
+            "или в ./project/models|Методы|methods."
+        )
+        _INTERP_UNAVAILABLE = True
+        return None
+    try:
+        sess = ort.InferenceSession(model_path)
+        in_name = sess.get_inputs()[0].name
+        out_name = sess.get_outputs()[0].name
+        _INTERP_SESSION = sess
+        _INTERP_IO_NAMES = (in_name, out_name)
+        LOG.info("ONNX интерполяция активирована: %s", model_path)
+        return _INTERP_SESSION
+    except Exception:
+        LOG.exception("Не удалось загрузить ONNX-модель интерполяции: %s", model_path)
+        _INTERP_UNAVAILABLE = True
+        return None
+
+
+def _apply_interp_onnx(arr):
+    import numpy as np
+
+    sess = _ensure_interp_session()
+    if sess is None or _INTERP_IO_NAMES is None:
+        return arr
+
+    if arr.ndim != 2 or arr.size == 0:
+        return arr
+
+    in_name, out_name = _INTERP_IO_NAMES
+    h, w = int(arr.shape[0]), int(arr.shape[1])
+    patch = 128
+    out = np.empty((h, w), dtype=np.float32)
+
+    for y0 in range(0, h, patch):
+        for x0 in range(0, w, patch):
+            y1 = min(y0 + patch, h)
+            x1 = min(x0 + patch, w)
+            tile = arr[y0:y1, x0:x1].astype(np.float32, copy=False)
+            if tile.shape != (patch, patch):
+                padded = np.zeros((patch, patch), dtype=np.float32)
+                padded[: tile.shape[0], : tile.shape[1]] = tile
+                tile = padded
+            inp = tile[np.newaxis, np.newaxis, :, :]
+            try:
+                pred = sess.run([out_name], {in_name: inp})[0]
+                rec = np.asarray(pred, dtype=np.float32)[0, 0]
+                out[y0:y1, x0:x1] = rec[: y1 - y0, : x1 - x0]
+            except Exception:
+                LOG.exception("Ошибка ONNX-интерполяции патча [%s:%s, %s:%s]", y0, y1, x0, x1)
+                out[y0:y1, x0:x1] = arr[y0:y1, x0:x1]
+    return out
 
 
 def validate_seismic_file(path: str) -> ValidationResult:
@@ -214,7 +310,7 @@ def _apply_pipeline_method(chunk, method_id: str):
 
     arr = np.asarray(chunk, dtype=np.float32)
     if method_id == "interp":
-        return arr * 1.0
+        return _apply_interp_onnx(arr)
     if method_id == "denoise":
         if arr.ndim != 2 or arr.shape[1] < 3:
             return arr
