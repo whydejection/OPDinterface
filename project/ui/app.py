@@ -1,7 +1,7 @@
 """Главное окно: только главный поток трогает виджеты Tk."""
 
 from __future__ import annotations
-
+from tkinter import ttk
 import queue
 import locale
 import threading
@@ -95,12 +95,10 @@ class App(ctk.CTk):
         self._home_window_cancel: Optional[threading.Event] = None
         self._home_window_after: Optional[str] = None
         self._home_window_start: int = 0
-        self._home_window_target: int = 0
         self._home_window_last: Optional[tuple[int, int]] = None
-        self._home_locked_by_selection: bool = False
-        self._home_btn_clear_selection: Any = None
+        self._home_slider: Any = None
+        self._home_slider_label: Any = None
         self.home_slider_status: Any = None
-        self._home_scroll_widget: Any = None
         self._plot_popups: dict[str, Any] = {}
         self._data_read_request_id: int = 0
         self._data_read_cancel: Optional[threading.Event] = None
@@ -359,6 +357,7 @@ class App(ctk.CTk):
         elif isinstance(msg, UiMessageProcessResult):
             if msg.request_id != self._process_request_id:
                 return
+            print("DEBUG: Processing result received, request_id ok")
             self.btn_processing_cancel.configure(state="disabled")
             self.btn_processing.configure(state="normal")
             self._process_cancel = None
@@ -385,6 +384,14 @@ class App(ctk.CTk):
                 trace_start=msg.start,
                 trace_step=msg.step,
             )
+            print("DEBUG: after_preview type =", type(msg.after_preview))
+            if msg.after_preview is not None:
+                print("DEBUG: after_preview shape =",
+                      msg.after_preview.shape if hasattr(msg.after_preview, 'shape') else 'no shape')
+            else:
+                print("DEBUG: after_preview is None")
+            self._fill_analysis_table(msg.after_preview, msg.start, msg.step, source="process")
+
         elif isinstance(msg, UiMessageWorkerError):
             if msg.request_id == self._load_request_id:
                 self._set_file_ui_busy(False)
@@ -525,9 +532,6 @@ class App(ctk.CTk):
         self.bind_all("<Control-O>", lambda e: self._shortcut_open_file())
         self.bind_all("<Control-z>", self._undo)
         self.bind_all("<Control-Z>", self._undo)
-        self.bind_all("<MouseWheel>", self._on_global_wheel, add="+")
-        self.bind_all("<Button-4>", self._on_global_wheel, add="+")
-        self.bind_all("<Button-5>", self._on_global_wheel, add="+")
 
     def _shortcut_open_file(self, event=None) -> Optional[str]:
         if self.current_state["tab"] != "Файл":
@@ -771,6 +775,14 @@ class App(ctk.CTk):
             border_color=C.ANALYSIS_WORKSPACE_BORDER,
         )
         self.analysis_workspace_canvas.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+
+        # Используем grid для точного управления расположением
+        self.analysis_workspace_canvas.grid_rowconfigure(0, weight=0)  # статус
+        self.analysis_workspace_canvas.grid_rowconfigure(1, weight=0)  # прогресс
+        self.analysis_workspace_canvas.grid_rowconfigure(2, weight=0)  # кнопка отмены
+        self.analysis_workspace_canvas.grid_rowconfigure(3, weight=0)  # таблица (не растягивается)
+        self.analysis_workspace_canvas.grid_columnconfigure(0, weight=1)
+
         self.analysis_status_label = ctk.CTkLabel(
             self.analysis_workspace_canvas,
             text="Выберите порядок методов и нажмите «Обработка».",
@@ -779,10 +791,12 @@ class App(ctk.CTk):
             justify="left",
             anchor="w",
         )
-        self.analysis_status_label.pack(fill="x", padx=12, pady=(12, 8))
+        self.analysis_status_label.grid(row=0, column=0, sticky="ew", padx=12, pady=(12, 8))
+
         self.analysis_progress = ctk.CTkProgressBar(self.analysis_workspace_canvas)
-        self.analysis_progress.pack(fill="x", padx=12, pady=(0, 12))
+        self.analysis_progress.grid(row=1, column=0, sticky="ew", padx=12, pady=(0, 12))
         self.analysis_progress.set(0.0)
+
         self.btn_processing_cancel = ctk.CTkButton(
             self.analysis_workspace_canvas,
             text="Отмена обработки",
@@ -795,9 +809,32 @@ class App(ctk.CTk):
             state="disabled",
             command=self._cancel_processing,
         )
-        self.btn_processing_cancel.pack(anchor="w", padx=12, pady=(0, 12))
+        self.btn_processing_cancel.grid(row=2, column=0, sticky="w", padx=12, pady=(0, 12))
+
+
+        # Таблица для выгрузки обработанных данных
+        table_frame = ctk.CTkFrame(self.analysis_workspace_canvas, fg_color="transparent")
+        table_frame.grid(row=3, column=0, sticky="ew", padx=12, pady=(0, 12))
+        table_frame.configure(height=300)  # фиксированная высота в пикселях
+        # Создаём таблицу с фиксированной высотой (количество видимых строк)
+        self.analysis_table = ttk.Treeview(table_frame, columns=("Время",), show="headings", height=12)
+        self.analysis_table.heading("Время", text="Время")
+
+        # Скроллы
+        v_scroll = ttk.Scrollbar(table_frame, orient="vertical", command=self.analysis_table.yview)
+        h_scroll = ttk.Scrollbar(table_frame, orient="horizontal", command=self.analysis_table.xview)
+        self.analysis_table.configure(yscrollcommand=v_scroll.set, xscrollcommand=h_scroll.set)
+
+        # Настройка растяжения внутри table_frame
+        table_frame.grid_rowconfigure(0, weight=0)   # не растягиваем по вертикали
+        table_frame.grid_columnconfigure(0, weight=1)  # растягиваем по горизонтали
+
+        self.analysis_table.grid(row=0, column=0, sticky="nsew")
+        v_scroll.grid(row=0, column=1, sticky="ns")
+        h_scroll.grid(row=1, column=0, sticky="ew")
 
         self._refresh_analysis_ui()
+
 
     def _setup_data_range_panel(self, parent: ctk.CTkFrame) -> None:
         """Панель выбора диапазона трасс (перенесено из бывшей вкладки «Данные»)."""
@@ -984,6 +1021,85 @@ class App(ctk.CTk):
             ev.set()
         self.analysis_status_label.configure(text="Отмена обработки...", text_color=C.STATUS_PENDING)
         self.btn_processing_cancel.configure(state="disabled")
+
+    def _fill_analysis_table(self, matrix: Any, trace_start: int, trace_step: int, source: str = "") -> None:
+        """
+        Заполнить таблицу в транспонированном виде: строки — отсчёты, столбцы — трассы.
+        source: "read" или "process" для разных сообщений.
+        """
+        # Очистим таблицу
+        for row in self.analysis_table.get_children():
+            self.analysis_table.delete(row)
+
+        # Полностью удалим все колонки кроме первой (пересоздадим)
+        existing = list(self.analysis_table["columns"])
+        for col in existing:
+            self.analysis_table["columns"] = tuple([c for c in existing if c != col])
+        # Теперь колонок нет, установим заново
+
+        if matrix is None:
+            self.analysis_table["columns"] = ("Время",)
+            self.analysis_table.heading("#0", text="")
+            self.analysis_table.heading("Время", text="Время")
+            return
+
+        import numpy as np
+        arr = np.asarray(matrix, dtype=np.float32)
+        if arr.ndim != 2 or arr.size == 0:
+            self.analysis_table["columns"] = ("Время",)
+            self.analysis_table.heading("#0", text="")
+            self.analysis_table.heading("Время", text="Время")
+            return
+
+        n_traces = arr.shape[0]
+        n_samples = arr.shape[1]
+        # Ограничим количество отображаемых трасс (например, 50)
+        max_traces = 50
+        if n_traces > max_traces:
+            self.analysis_status_label.configure(
+                text=f"Внимание: выбрано {n_traces} трасс, показаны первые {max_traces}.",
+                text_color=C.STATUS_WARN
+            )
+            n_traces = max_traces
+
+        # Создадим колонки: первая "Время", затем для каждой трассы
+        columns = ["Время"]
+        trace_columns = []  # для хранения реальных номеров
+        for i in range(n_traces):
+            real_trace_num = trace_start + i * trace_step
+            col_name = f"Трасса {real_trace_num}"
+            columns.append(col_name)
+            trace_columns.append(col_name)
+
+        self.analysis_table["columns"] = tuple(columns)
+        # Настроим заголовки
+        self.analysis_table.heading("Время", text="Время")
+        for col in trace_columns:
+            self.analysis_table.heading(col, text=col)
+        # Настроим ширину и выравнивание
+        self.analysis_table.column("Время", width=60, anchor="center")
+        for col in trace_columns:
+            self.analysis_table.column(col, width=70, anchor="center")
+
+        # Заполняем строки по отсчётам (время)
+        for sample_idx in range(n_samples):
+            row_values = [str(sample_idx)]  # первая колонка - номер отсчёта
+            for tr_idx in range(n_traces):
+                amp = arr[tr_idx, sample_idx]
+                row_values.append(f"{amp:.4f}")
+            self.analysis_table.insert("", "end", values=row_values)
+
+        # Обновим статусную строку
+        if source == "read":
+            self.analysis_status_label.configure(
+                text=f"Выбрано {n_traces} трасс, {n_samples} отсчётов. Таблица показывает амплитуды по отсчётам.",
+                text_color=C.STATUS_OK
+            )
+        else:
+            self.analysis_status_label.configure(
+                text=f"Обработано {n_traces} трасс, {n_samples} отсчётов. Таблица показывает амплитуды по отсчётам.",
+                text_color=C.STATUS_OK
+            )
 
     def _method_interp(self, chunk: Any) -> Any:
         return chunk * 1.0
@@ -1687,7 +1803,6 @@ class App(ctk.CTk):
         self._home_view_start = 0
         self._home_view_end = 0
         self._home_view_step = 1
-        self._home_locked_by_selection = False
         self._home_selected_ranges = []
         self._home_selection_patches = []
         if self._home_window_cancel is not None:
@@ -1704,129 +1819,68 @@ class App(ctk.CTk):
                 pass
         self._home_window_after = None
         try:
+            if self._home_slider is not None:
+                self._home_slider.configure(state="disabled", from_=0, to=0, number_of_steps=0)
+        except Exception:
+            pass
+        try:
+            if self._home_slider_label is not None:
+                self._home_slider_label.configure(text="Окно: —")
+        except Exception:
+            pass
+        try:
             if self.home_slider_status is not None:
                 self.home_slider_status.configure(text="")
         except Exception:
             pass
 
     def _sync_home_slider_after_load(self) -> None:
-        self._home_window_start = 0
-        self._home_window_last = None
+        if not self.current_file_path or self.total_traces <= 0:
+            return
+        max_start = max(0, int(self.total_traces) - int(self._home_window_size))
+        steps = max(1, min(max_start, 5000))
+        try:
+            if self._home_slider is not None:
+                self._home_slider.configure(from_=0, to=max_start, number_of_steps=steps, state="normal")
+                self._home_slider.set(0)
+        except Exception:
+            pass
+        try:
+            if self._home_slider_label is not None:
+                end = min(self.total_traces, self._home_window_size) - 1
+                self._home_slider_label.configure(text=f"0…{max(0, end)}")
+        except Exception:
+            pass
         try:
             if self.home_slider_status is not None:
                 self.home_slider_status.configure(text="")
         except Exception:
             pass
 
-    def _on_home_scroll(self, event) -> None:
-        if event is None or event.inaxes is not getattr(self, "_home_ax_before", None):
-            return
+    def _on_home_slider_changed(self, value: float) -> None:
+        """Debounce: не читать файл на каждом шаге перетаскивания."""
         if not self.current_file_path or self.total_traces <= 0:
             return
-        direction = 0
         try:
-            if hasattr(event, "step") and event.step:
-                direction = 1 if float(event.step) > 0 else -1
-            elif getattr(event, "button", None) == "up":
-                direction = 1
-            elif getattr(event, "button", None) == "down":
-                direction = -1
+            start = int(round(float(value)))
         except Exception:
-            direction = 0
-        self._scroll_home_window(direction)
-
-    def _on_home_scroll_tk(self, event) -> str:
-        """Прокрутка по тачпаду/колесу на Tk-виджете Matplotlib."""
-        if not self._is_pointer_over_home_plot():
-            return "break"
-        if not self.current_file_path or self.total_traces <= 0:
-            return "break"
-        direction = 0
-        try:
-            # Windows/macOS обычно дают event.delta, Linux может давать num=4/5.
-            delta = int(getattr(event, "delta", 0) or 0)
-            if delta > 0:
-                direction = 1
-            elif delta < 0:
-                direction = -1
-            else:
-                num = int(getattr(event, "num", 0) or 0)
-                if num == 4:
-                    direction = 1
-                elif num == 5:
-                    direction = -1
-        except Exception:
-            direction = 0
-        self._scroll_home_window(direction)
-        return "break"
-
-    def _on_global_wheel(self, event) -> Optional[str]:
-        # Глобальный fallback: часть тачпадов шлёт wheel-события не в canvas.
-        if not self._is_pointer_over_home_plot():
-            return None
-        return self._on_home_scroll_tk(event)
-
-    def _is_pointer_over_home_plot(self) -> bool:
-        if self.current_state.get("tab") != "Главная":
-            return False
-        w = self._home_scroll_widget
-        if w is None:
-            return False
-        try:
-            px = int(self.winfo_pointerx())
-            py = int(self.winfo_pointery())
-            under = self.winfo_containing(px, py)
-        except Exception:
-            return False
-        if under is None:
-            return False
-        cur = under
-        while cur is not None:
-            if cur is w:
-                return True
-            try:
-                cur = cur.master
-            except Exception:
-                break
-        return False
-
-    def _scroll_home_window(self, direction: int) -> None:
-        if direction == 0:
-            return
-        if not self.current_file_path or self.total_traces <= 0:
-            return
-        if self._home_locked_by_selection:
-            try:
-                if self.home_slider_status is not None:
-                    self.home_slider_status.configure(text="Снимите выбор, чтобы снова прокручивать график.")
-            except Exception:
-                pass
-            return
-        step = 10
+            start = 0
         max_start = max(0, int(self.total_traces) - int(self._home_window_size))
-        base = int(self._home_window_target if self._home_window_target is not None else self._home_window_start)
-        start = int(max(0, min(max_start, base - direction * step)))
-        self._home_window_target = start
+        start = max(0, min(max_start, start))
+        self._home_window_start = start
+        try:
+            if self._home_slider_label is not None:
+                end = min(self.total_traces, start + self._home_window_size) - 1
+                self._home_slider_label.configure(text=f"{start}…{max(start, end)}")
+        except Exception:
+            pass
         if self._home_window_after is not None:
             try:
                 self.after_cancel(self._home_window_after)
             except Exception:
                 pass
             self._home_window_after = None
-        self._home_window_after = self.after(20, lambda: self._request_home_window_read(start))
-
-    def _clear_home_selection_lock(self) -> None:
-        """Снять выбор диапазона и вернуть прокрутку окна 500 трасс."""
-        self._home_locked_by_selection = False
-        self._home_selected_ranges = []
-        self._home_selection_patches = []
-        if self.current_file_path and self.total_traces > 0:
-            self._request_home_window_read(int(self._home_window_start), force=True)
-        try:
-            if self.home_slider_status is not None:
-                self.home_slider_status.configure(text="")
-        except Exception:
-            pass
+        self._home_window_after = self.after(180, lambda: self._request_home_window_read(start))
 
     def _request_home_window_read(self, start: int, *, force: bool = False) -> None:
         if not self.current_file_path or self.total_traces <= 0:
@@ -1849,8 +1903,6 @@ class App(ctk.CTk):
         if not force and self._home_window_last == (start, end):
             return
         self._home_window_last = (start, end)
-        self._home_window_start = int(start)
-        self._home_window_target = int(start)
 
         ev = self._home_window_cancel
         if ev is not None:
@@ -1876,6 +1928,11 @@ class App(ctk.CTk):
         except Exception:
             pass
 
+        try:
+            if self._home_slider_label is not None:
+                self._home_slider_label.configure(text=f"{start}…{max(start, end - 1)}")
+        except Exception:
+            pass
         try:
             if self.home_slider_status is not None:
                 self.home_slider_status.configure(text="Чтение окна: 0%")
@@ -1905,8 +1962,6 @@ class App(ctk.CTk):
         self._home_view_start = int(msg.start)
         self._home_view_end = int(msg.end)
         self._home_view_step = int(max(1, msg.step))
-        self._home_window_start = int(msg.start)
-        self._home_window_target = int(msg.start)
 
         plot_matrix = msg.full_matrix if msg.keep_full_matrix and msg.full_matrix is not None else msg.preview_matrix
         if plot_matrix is None:
@@ -1964,19 +2019,16 @@ class App(ctk.CTk):
                 text=cached["message"] + " (из кэша)",
                 text_color=C.STATUS_OK,
             )
-            # При "Выбрать данные" обновляем график на вкладке "Главная", без всплывающего окна.
-            self._home_view_start = int(start)
-            self._home_view_end = int(end)
-            self._home_view_step = int(max(1, step))
-            self._home_locked_by_selection = True
-            self._update_home_before_from_matrix(cached["plot_matrix"])
-            self._draw_home_selection_overlay(start, end)
-            try:
-                if self.home_slider_status is not None:
-                    self.home_slider_status.configure(text="Выбор зафиксирован. Нажмите «Снять выбор».")
-            except Exception:
-                pass
+            self._open_plot_popup(
+                key="before",
+                title="График До",
+                matrix=cached["plot_matrix"],
+                trace_start=start,
+                trace_step=step,
+            )
+            self._fill_analysis_table(cached["plot_matrix"], start, step, source="read")
             return
+
 
         self._data_read_request_id += 1
         req_id = self._data_read_request_id
@@ -2013,18 +2065,15 @@ class App(ctk.CTk):
         self.matrix_data = msg.full_matrix
         plot_matrix = msg.full_matrix if msg.keep_full_matrix and msg.full_matrix is not None else msg.preview_matrix
         self.label_data_result.configure(text=text, text_color=C.STATUS_OK)
-        # При "Выбрать данные" обновляем график на "Главная" и фиксируем диапазон до снятия выбора.
-        self._home_view_start = int(msg.start)
-        self._home_view_end = int(msg.end)
-        self._home_view_step = int(max(1, msg.step))
-        self._home_locked_by_selection = True
-        self._update_home_before_from_matrix(plot_matrix)
-        self._draw_home_selection_overlay(int(msg.start), int(msg.end))
-        try:
-            if self.home_slider_status is not None:
-                self.home_slider_status.configure(text="Выбор зафиксирован. Нажмите «Снять выбор».")
-        except Exception:
-            pass
+        # Важно: чтение диапазона для «Анализ» не должно менять окно/график «Главная».
+        self._open_plot_popup(
+            key="before",
+            title="График До",
+            matrix=plot_matrix,
+            trace_start=msg.start,
+            trace_step=msg.step,
+        )
+        self._fill_analysis_table(plot_matrix, msg.start, msg.step, source="read")
         try:
             cache_key = (
                 self.current_file_path or "",
@@ -2209,27 +2258,52 @@ class App(ctk.CTk):
         outer = ctk.CTkFrame(f, fg_color="transparent")
         outer.pack(fill="both", expand=True, padx=10, pady=10)
         outer.grid_columnconfigure(0, weight=1, uniform="home")
-        outer.grid_rowconfigure(0, weight=0)
-        outer.grid_rowconfigure(1, weight=1)
+        # Ряд 0 — график (растягивается), ряд 1 — бегунок снизу
+        outer.grid_rowconfigure(0, weight=1)
+        outer.grid_rowconfigure(1, weight=0)
 
-        top_controls = ctk.CTkFrame(outer, fg_color="transparent")
-        top_controls.grid(row=0, column=0, sticky="ew", padx=2, pady=(0, 6))
+        controls = ctk.CTkFrame(outer, fg_color="transparent")
+        controls.grid(row=1, column=0, sticky="ew", padx=2, pady=(8, 0))
+        controls.grid_columnconfigure(1, weight=1)
+
         ctk.CTkLabel(
-            top_controls,
-            text="Прокрутка: колесо мыши / тачпад",
+            controls,
+            text="Окно 500 трасс:",
+            font=C.FONT_BODY,
+            text_color=C.GRAY_TEXT,
+            anchor="w",
+        ).grid(row=0, column=0, sticky="w", padx=(6, 10))
+
+        self._home_slider = ctk.CTkSlider(
+            controls,
+            from_=0,
+            to=0,
+            number_of_steps=1,
+            command=self._on_home_slider_changed,
+        )
+        self._home_slider.grid(row=0, column=1, sticky="ew", padx=(0, 10))
+        try:
+            self._home_slider.configure(state="disabled")
+        except Exception:
+            pass
+
+        self._home_slider_label = ctk.CTkLabel(
+            controls,
+            text="Окно: —",
+            font=C.FONT_BODY,
+            text_color=C.GRAY_TEXT,
+            width=140,
+            anchor="e",
+        )
+        self._home_slider_label.grid(row=0, column=2, sticky="e", padx=(0, 6))
+        self.home_slider_status = ctk.CTkLabel(
+            controls,
+            text="",
             font=C.FONT_SMALL,
             text_color=C.GRAY_TEXT_MUTED,
             anchor="w",
-        ).pack(side="left", padx=(4, 8))
-        self._home_btn_clear_selection = ctk.CTkButton(
-            top_controls,
-            text="Снять выбор",
-            width=130,
-            height=30,
-            font=C.FONT_SMALL,
-            command=self._clear_home_selection_lock,
         )
-        self._home_btn_clear_selection.pack(side="right", padx=(8, 4))
+        self.home_slider_status.grid(row=1, column=0, columnspan=3, sticky="ew", padx=6, pady=(2, 0))
 
         def pane(row: int, col: int, title: str, pad_l: int, pad_r: int) -> ctk.CTkFrame:
             box = ctk.CTkFrame(
@@ -2253,7 +2327,7 @@ class App(ctk.CTk):
             host.grid(row=1, column=0, sticky="nsew", padx=10, pady=(0, 10))
             return host
 
-        self._home_plot_host_before = pane(1, 0, "Исходные данные", 0, 0)
+        self._home_plot_host_before = pane(0, 0, "Исходные данные", 0, 0)
         self._home_matplotlib_ok = False
         self._home_fig_before = None
         self._home_ax_before = None
@@ -2292,15 +2366,6 @@ class App(ctk.CTk):
             self._home_canvas_before.mpl_connect("button_press_event", self._on_home_before_press)
             self._home_canvas_before.mpl_connect("motion_notify_event", self._on_home_before_motion)
             self._home_canvas_before.mpl_connect("button_release_event", self._on_home_before_release)
-            self._home_canvas_before.mpl_connect("scroll_event", self._on_home_scroll)
-            try:
-                tk_canvas = self._home_canvas_before.get_tk_widget()
-                self._home_scroll_widget = tk_canvas
-                tk_canvas.bind("<MouseWheel>", self._on_home_scroll_tk, add="+")
-                tk_canvas.bind("<Button-4>", self._on_home_scroll_tk, add="+")
-                tk_canvas.bind("<Button-5>", self._on_home_scroll_tk, add="+")
-            except Exception:
-                pass
             self._home_matplotlib_ok = True
         except Exception:
             ctk.CTkLabel(
@@ -2331,7 +2396,6 @@ class App(ctk.CTk):
             return
         self._home_apply_placeholder(self._home_ax_before, "Загрузите файл на вкладке «Файл».")
         self._home_selection_patch = None
-        self._home_locked_by_selection = False
         self._home_selected_ranges = []
         self._home_selection_patches = []
         self._home_canvas_before.draw()
@@ -2346,7 +2410,7 @@ class App(ctk.CTk):
         if preview is None:
             self._home_apply_placeholder(
                 axb,
-                "Файл подключён. Прокручивайте колесом мыши/тачпадом,\nчтобы подгружать и отображать окно из 500 трасс.",
+                "Файл подключён. Двигайте бегунок снизу,\nчтобы подгрузить и отобразить 500 трасс.",
             )
         else:
             import numpy as np
