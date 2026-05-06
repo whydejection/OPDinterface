@@ -397,6 +397,8 @@ class App(ctk.CTk):
                 trace_step=msg.step,
                 normalized=True,
             )
+            # Заполняем таблицу результатами после завершения обработки.
+            self._fill_analysis_table(msg.after_preview, msg.start, msg.step, source="process")
         elif isinstance(msg, UiMessageWorkerError):
             if msg.request_id == self._load_request_id:
                 self._set_file_ui_busy(False)
