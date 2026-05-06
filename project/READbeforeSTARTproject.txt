@@ -1,0 +1,16 @@
+Для стабильной работы приложения установите все библиотеки:
+
+customtkinter (>=5.2)
+tkinterdnd2 (>=0.3.0)
+numpy (>=1.24)
+matplotlib (>=3.7)
+segyio (>=1.9.12)
+
+Библиотеки, которые используются в .py файлах (import/from):
+
+customtkinter
+tkinterdnd2
+numpy
+matplotlib
+segyio
+
