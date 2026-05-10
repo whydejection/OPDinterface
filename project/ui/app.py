@@ -389,6 +389,8 @@ class App(ctk.CTk):
                 trace_step=msg.step,
                 normalized=True,
             )
+
+
             self._open_plot_popup(
                 key="after",
                 title="График После",
@@ -398,7 +400,7 @@ class App(ctk.CTk):
                 normalized=True,
             )
             # Заполняем таблицу результатами после завершения обработки.
-            self._fill_analysis_table(msg.after_preview, msg.start, msg.step, source="process")
+            #self._fill_analysis_table(msg.after_preview, msg.start, msg.step, source="process")
         elif isinstance(msg, UiMessageWorkerError):
             if msg.request_id == self._load_request_id:
                 self._set_file_ui_busy(False)
@@ -735,6 +737,14 @@ class App(ctk.CTk):
         self.analysis_body.grid_columnconfigure(0, weight=4)
         self.analysis_body.grid_columnconfigure(1, weight=6)
 
+        style = ttk.Style()
+        style.theme_use("clam")  # "clam" лучше всего подходит для смены цветов
+        style.configure("Treeview.Heading",
+                        background="white",  # Белый фон
+                        foreground="black",  # Черный текст
+                        font=('Arial', 10, 'bold'))
+
+
         left_col = ctk.CTkFrame(self.analysis_body, fg_color="transparent", width=C.LEFT_COL_W)
         left_col.grid(row=0, column=0, sticky="nsew", padx=(0, 12), pady=0)
         left_col.grid_propagate(False)
@@ -820,7 +830,7 @@ class App(ctk.CTk):
             border_width=1,
             border_color=C.ANALYSIS_WORKSPACE_BORDER,
         )
-        self.analysis_workspace_canvas.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+        self.analysis_workspace_canvas.pack(fill="x", expand=False, padx=12, pady=(0, 12))
 
         # Используем grid для точного управления расположением
         self.analysis_workspace_canvas.grid_rowconfigure(0, weight=0)  # статус
@@ -854,18 +864,35 @@ class App(ctk.CTk):
         self.analysis_progress.grid(row=0, column=0, sticky="ew", padx=(10, 8), pady=8)
         self.analysis_progress.set(0.0)
 
-        self.btn_analysis_export = ctk.CTkButton(
+        self.btn_show_in_table = ctk.CTkButton(
             self.analysis_taskbar,
-            text="Выгрузить данные",
+            text="Показать в таблице",
             width=150,
             height=28,
             font=C.FONT_SMALL,
             fg_color=C.ACCENT,
             hover_color=C.ACCENT_DARK,
             text_color="white",
-            command=self._export_analysis_table,
+            command=self._show_data_in_table,  # Вызывает новый метод
         )
-        self.btn_analysis_export.grid(row=0, column=1, sticky="e", padx=(0, 10), pady=6)
+        self.btn_show_in_table.grid(row=0, column=1, sticky="e", padx=(0, 10), pady=6)
+
+        self.btn_analysis_export = ctk.CTkButton(
+            self.analysis_taskbar,
+            text="В CSV",
+            width=80,
+            height=28,
+            font=C.FONT_SMALL,
+            fg_color=C.STATUS_OK,
+            hover_color="#27ae60",
+            text_color="white",
+            command=self._export_analysis_table,  # Сохраняет старый функционал
+        )
+        self.btn_analysis_export.grid(row=0, column=2, sticky="e", padx=(0, 10), pady=6)
+
+
+
+
 
         self.btn_processing_cancel = ctk.CTkButton(
             self.analysis_workspace_canvas,
@@ -881,27 +908,73 @@ class App(ctk.CTk):
         )
         self.btn_processing_cancel.grid(row=2, column=0, sticky="w", padx=12, pady=(0, 12))
 
-
         # Таблица для выгрузки обработанных данных
-        table_frame = ctk.CTkFrame(self.analysis_workspace_canvas, fg_color="transparent")
-        table_frame.grid(row=3, column=0, sticky="ew", padx=12, pady=(0, 12))
-        table_frame.configure(height=300)  # фиксированная высота в пикселях
-        # Создаём таблицу с фиксированной высотой (количество видимых строк)
-        self.analysis_table = ttk.Treeview(table_frame, columns=("Время",), show="headings", height=12)
-        self.analysis_table.heading("Время", text="Время")
+        table_frame = ctk.CTkFrame(self.analysis_workspace_canvas, fg_color="transparent",width=950, height=450)
+        # sticky="nsew" заставляет фрейм занять всё доступное место
+        table_frame.grid(row=3, column=0, sticky="nsew", padx=12, pady=(0, 12))
+        table_frame.grid_propagate(False)
+        # Настраиваем внутренности table_frame, чтобы сама таблица тянулась внутри него
+        table_frame.grid_rowconfigure(0, weight=1)
+        table_frame.grid_columnconfigure(0, weight=1)
 
-        # Скроллы
+        self.analysis_table = ttk.Treeview(
+            table_frame,
+            columns=("Время",),
+            show="headings",
+            selectmode="browse"
+        )
+
+
         v_scroll = ttk.Scrollbar(table_frame, orient="vertical", command=self.analysis_table.yview)
         h_scroll = ttk.Scrollbar(table_frame, orient="horizontal", command=self.analysis_table.xview)
         self.analysis_table.configure(yscrollcommand=v_scroll.set, xscrollcommand=h_scroll.set)
 
-        # Настройка растяжения внутри table_frame
-        table_frame.grid_rowconfigure(0, weight=0)   # не растягиваем по вертикали
-        table_frame.grid_columnconfigure(0, weight=1)  # растягиваем по горизонтали
-
+        # Теперь таблица и скроллбары плотно прилегают к краям и тянутся
         self.analysis_table.grid(row=0, column=0, sticky="nsew")
         v_scroll.grid(row=0, column=1, sticky="ns")
         h_scroll.grid(row=1, column=0, sticky="ew")
+
+        # Чистый стиль: белый фон, черные границы и текст
+        style = ttk.Style()
+        style.theme_use("clam")
+
+        style.configure("Treeview",
+                        background="white",
+                        fieldbackground="white",
+                        foreground="black",
+                        rowheight=25,
+                        borderwidth=1)
+
+        style.configure("Treeview.Heading",
+                        background="#f0f0f0",
+                        foreground="black",
+                        relief="ridge",
+                        font=('Arial', 10, 'bold'))
+
+        # ПРОСТО ТЕКСТ (Подпись), как ты и просила
+        self.traces_caption = ctk.CTkLabel(
+            table_frame,
+            text="амплитуды трасс",
+            font=('Arial', 11, 'italic'),
+            text_color="gray"
+        )
+        # Размещаем над таблицей, прижимая к правому краю (над номерами)
+        self.traces_caption.grid(row=0, column=0, sticky="e", padx=50, pady=(5, 0))
+
+        # Только таблица, без лишних элементов
+        self.analysis_table = ttk.Treeview(table_frame, selectmode="browse")
+        self.analysis_table.grid(row=0, column=0, sticky="nsew")
+
+        self.analysis_v_scroll = ttk.Scrollbar(table_frame, orient="vertical", command=self.analysis_table.yview)
+        self.analysis_v_scroll.grid(row=0, column=1, sticky="ns")  # ВОТ ЭТА СТРОКА (516)
+        self.analysis_table.configure(yscrollcommand=self.analysis_v_scroll.set)
+
+        self.analysis_h_scroll = ttk.Scrollbar(table_frame, orient="horizontal", command=self.analysis_table.xview)
+        self.analysis_h_scroll.grid(row=1, column=0, sticky="ew")
+        self.analysis_table.configure(xscrollcommand=self.analysis_h_scroll.set)
+        table_frame.grid_rowconfigure(1, weight=1)
+        table_frame.grid_columnconfigure(0, weight=1)
+
 
         self._refresh_analysis_ui()
 
@@ -1081,96 +1154,42 @@ class App(ctk.CTk):
         self.btn_processing_cancel.configure(state="disabled")
 
     def _fill_analysis_table(self, matrix: Any, trace_start: int, trace_step: int, source: str = "") -> None:
-        """
-        Заполнить таблицу в транспонированном виде: строки — отсчёты, столбцы — трассы.
-        source: "read" или "process" для разных сообщений.
-        """
-        # Очистим таблицу
-        for row in self.analysis_table.get_children():
-            self.analysis_table.delete(row)
+        if matrix is None: return
 
-        # Полностью удалим все колонки кроме первой (пересоздадим)
-        existing = list(self.analysis_table["columns"])
-        for col in existing:
-            self.analysis_table["columns"] = tuple([c for c in existing if c != col])
-        # Теперь колонок нет, установим заново
-
-        if matrix is None:
-            self.analysis_table["columns"] = ("Время",)
-            self.analysis_table.heading("#0", text="")
-            self.analysis_table.heading("Время", text="Время")
-            return
+        # Очистка
+        self.analysis_table.delete(*self.analysis_table.get_children())
+        self.analysis_table.configure(columns=[], displaycolumns=[])
 
         import numpy as np
         arr = np.asarray(matrix, dtype=np.float32)
-        if arr.ndim != 2 or arr.size == 0:
-            self.analysis_table["columns"] = ("Время",)
-            self.analysis_table.heading("#0", text="")
-            self.analysis_table.heading("Время", text="Время")
-            return
+        n_traces, n_samples = arr.shape
 
-        n_traces = arr.shape[0]
-        n_samples = arr.shape[1]
-        # Ограничим количество отображаемых трасс (например, 50)
-        max_traces = 50
-        if n_traces > max_traces:
-            self.analysis_status_label.configure(
-                text=f"Внимание: выбрано {n_traces} трасс, показаны первые {max_traces}.",
-                text_color=C.STATUS_WARN
-            )
-            n_traces = max_traces
-
-        # Создадим колонки: первая "Время", затем для каждой трассы
-        columns = ["Время"]
-        trace_columns = []  # для хранения реальных номеров
+        # Колонки (всегда №)
+        new_columns = ["Время"]
         for i in range(n_traces):
-            real_trace_num = trace_start + i * trace_step
-            col_name = f"Трасса {real_trace_num}"
-            columns.append(col_name)
-            trace_columns.append(col_name)
+            real_num = int(trace_start + i * trace_step)
+            new_columns.append(f"№{real_num}")
 
-        self.analysis_table["columns"] = tuple(columns)
-        # Настроим заголовки
-        self.analysis_table.heading("Время", text="Время")
-        for col in trace_columns:
-            self.analysis_table.heading(col, text=col)
-        # Настроим ширину и выравнивание
-        self.analysis_table.column("Время", width=60, anchor="center")
-        for col in trace_columns:
-            self.analysis_table.column(col, width=70, anchor="center")
+        self.analysis_table["columns"] = new_columns
+        self.analysis_table["displaycolumns"] = new_columns
+        self.analysis_table.configure(show="headings")
 
-        # Заполняем строки по отсчётам (время)
+        # Безопасная ширина для исключения бага Tkinter (лимит 32к пикселей)
+        trace_w = max(55, 31000 // n_traces) if n_traces > 100 else 95
+
+        for col in new_columns:
+            self.analysis_table.heading(col, text=col, anchor="center")
+            w = 90 if col == "Время" else trace_w
+            self.analysis_table.column(col, width=w, minwidth=w, stretch=False, anchor="center")
+
+        # Заполнение
         for sample_idx in range(n_samples):
-            row_values = [str(sample_idx)]  # первая колонка - номер отсчёта
-            for tr_idx in range(n_traces):
-                amp = arr[tr_idx, sample_idx]
-                row_values.append(f"{amp:.4f}")
-            self.analysis_table.insert("", "end", values=row_values)
+            row_vals = [f"{sample_idx * 0.004:.4f}"]
+            row_vals.extend([f"{val:.4f}" for val in arr[:, sample_idx]])
+            self.analysis_table.insert("", "end", values=row_vals)
 
-        # Обновим статусную строку
-        if source == "read":
-            self.analysis_status_label.configure(
-                text=f"Выбрано {n_traces} трасс, {n_samples} отсчётов. Таблица показывает амплитуды по отсчётам.",
-                text_color=C.STATUS_OK
-            )
-        else:
-            self.analysis_status_label.configure(
-                text=f"Обработано {n_traces} трасс, {n_samples} отсчётов. Таблица показывает амплитуды по отсчётам.",
-                text_color=C.STATUS_OK
-            )
-
-    def _method_interp(self, chunk: Any) -> Any:
-        return chunk * 1.0
-
-    def _method_denoise(self, chunk: Any) -> Any:
-        import numpy as np
-
-        arr = np.asarray(chunk, dtype=np.float32)
-        if arr.ndim != 2 or arr.shape[1] < 3:
-            return arr
-        out = arr.copy()
-        out[:, 1:-1] = (arr[:, :-2] + arr[:, 1:-1] + arr[:, 2:]) / 3.0
-        return out
+        self.analysis_table.update_idletasks()
+        self.analysis_table.xview_moveto(0)
 
     def _method_spectrum(self, chunk: Any) -> Any:
         import numpy as np
@@ -2143,6 +2162,7 @@ class App(ctk.CTk):
                 normalized=bool(cached.get("plot_matrix_normed", False)),
             )
             self._draw_home_selection_overlay(start, end)
+            #self._fill_analysis_table(cached["plot_matrix"], start, step, source="read")
             try:
                 if self.home_slider_status is not None:
                     self.home_slider_status.configure(text="Выбор зафиксирован. Нажмите «Снять выбор».")
@@ -2196,6 +2216,8 @@ class App(ctk.CTk):
         self._home_locked_by_selection = True
         self._update_home_before_from_matrix(plot_matrix, normalized=(not use_full))
         self._draw_home_selection_overlay(int(msg.start), int(msg.end))
+        # Заполняем таблицу на вкладке Анализ
+        #self._fill_analysis_table(self._analysis_export_source, msg.start, msg.step, source="read")
         try:
             if self.home_slider_status is not None:
                 self.home_slider_status.configure(text="Выбор зафиксирован. Нажмите «Снять выбор».")
@@ -2474,6 +2496,29 @@ class App(ctk.CTk):
         canvas.draw()
         self._plot_popups["fourier"] = top
         self.analysis_status_label.configure(text="FFT построен.", text_color=C.STATUS_OK)
+
+    def _show_data_in_table(self) -> None:
+        """Отображает данные в таблице только по запросу пользователя."""
+        if self._analysis_export_source is None:
+            messagebox.showinfo(
+                "Таблица",
+                "Нет данных для отображения. Сначала выберите данные или запустите обработку.",
+                parent=self,
+            )
+            return
+
+        self.analysis_status_label.configure(text="Подготовка таблицы...", text_color=C.STATUS_PENDING)
+        self.update_idletasks()  # Обновляем UI, чтобы текст появился до зависания на отрисовке
+
+        self._fill_analysis_table(
+            self._analysis_export_source,
+            self._analysis_export_start,
+            self._analysis_export_step,
+            source="manual"
+        )
+
+
+
 
     def _export_analysis_table(self) -> None:
         import numpy as np
