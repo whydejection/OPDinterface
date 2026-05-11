@@ -1931,29 +1931,41 @@ class App(ctk.CTk):
         if not self._is_pointer_over_home_plot() or self.total_traces <= 0:
             return "break"
 
-        # Проверяем нажат ли Ctrl (маска 0x4)
+        # 1. Проверяем зажат ли Ctrl (0x4 — стандарт для Windows/Linux)
         is_ctrl = (event.state & 0x4) != 0
 
+        # 2. Определяем направление (колесико вверх/вниз)
         direction = 0
-        delta = int(getattr(event, "delta", 0) or 0)
-        if delta > 0:
-            direction = 1
-        elif delta < 0:
-            direction = -1
-        else:
-            num = int(getattr(event, "num", 0) or 0)
-            if num == 4:
-                direction = 1
-            elif num == 5:
-                direction = -1
+        if event.delta > 0 or event.num == 4:
+            direction = 1  # Вперед/Вверх
+        elif event.delta < 0 or event.num == 5:
+            direction = -1  # Назад/Вниз
+
+        if direction == 0:
+            return "break"
 
         if is_ctrl:
-            self._home_zoom(direction)  # Если зажат Ctrl — зумим
+            # ЗУМ В КУРСОР
+            try:
+                canvas_widget = self._home_canvas_before.get_tk_widget()
+                # Координата X внутри виджета
+                lx = event.x
+                # Инвертируем Y (в Tkinter 0 сверху, в Matplotlib 0 снизу)
+                ly = canvas_widget.winfo_height() - event.y
+
+                # Переводим пиксели в номер трассы
+                inv = self._home_ax_before.transData.inverted()
+                data_coords = inv.transform((lx, ly))
+                anchor = self._home_trace_from_x(data_coords[0])
+            except Exception:
+                anchor = None  # Если не вышло, зумим в центр экрана
+
+            self._home_zoom(direction, anchor_trace=anchor)
         else:
-            self._scroll_home_window(direction)  # Если нет — скроллим
+            # ОБЫЧНЫЙ СКРОЛЛ (тоже должен уважать границы)
+            self._scroll_home_window(direction)
 
         return "break"
-
     def _on_global_wheel(self, event) -> Optional[str]:
         # Глобальный fallback: часть тачпадов шлёт wheel-события не в canvas.
         if not self._is_pointer_over_home_plot():
@@ -1985,28 +1997,35 @@ class App(ctk.CTk):
         return False
 
     def _scroll_home_window(self, direction: int) -> None:
-        if direction == 0:
+        if direction == 0 or not self.current_file_path or self.total_traces <= 0:
             return
-        if not self.current_file_path or self.total_traces <= 0:
-            return
+
+        step = max(5, self._home_window_size // 10)
+        base = int(self._home_window_target if self._home_window_target is not None else self._home_window_start)
+        start = base - direction * step
+
+        # Скроллим только внутри разрешенного ящика
         if self._home_locked_by_selection:
             try:
-                if self.home_slider_status is not None:
-                    self.home_slider_status.configure(text="Снимите выбор, чтобы снова прокручивать график.")
-            except Exception:
-                pass
-            return
-        step = 10
-        max_start = max(0, int(self.total_traces) - int(self._home_window_size))
-        base = int(self._home_window_target if self._home_window_target is not None else self._home_window_start)
-        start = int(max(0, min(max_start, base - direction * step)))
+                l_min = int(self.entry_data_start.get())
+                l_max = int(self.entry_data_end.get())
+            except ValueError:
+                l_min, l_max = 0, self.total_traces
+
+            # Блокируем сдвиг влево/вправо за границы От и До
+            start = max(l_min, min(start, l_max - self._home_window_size))
+        else:
+            max_start = max(0, int(self.total_traces) - int(self._home_window_size))
+            start = max(0, min(max_start, start))
+
         self._home_window_target = start
         if self._home_window_after is not None:
             try:
                 self.after_cancel(self._home_window_after)
-            except Exception:
+            except:
                 pass
             self._home_window_after = None
+
         self._home_window_after = self.after(20, lambda: self._request_home_window_read(start))
 
     def _clear_home_selection_lock(self) -> None:
@@ -2014,90 +2033,114 @@ class App(ctk.CTk):
         self._home_locked_by_selection = False
         self._home_selected_ranges = []
         self._home_selection_patches = []
+
         if self.current_file_path and self.total_traces > 0:
             self._request_home_window_read(int(self._home_window_start), force=True)
+
         try:
             if self.home_slider_status is not None:
                 self.home_slider_status.configure(text="")
         except Exception:
             pass
-
-
-        self._request_home_window_read(new_start, force=True)
-
-    def _home_zoom(self, direction: int) -> None:
+    def _home_zoom(self, direction: int, anchor_trace: Optional[int] = None) -> None:
         if not self.current_file_path or self.total_traces <= 0:
             return
 
-        # Считаем новый размер окна (шаг 20%)
+        # 1. Читаем настоящие границы ВЫБОРА из текстовых полей (они теперь святые)
+        if self._home_locked_by_selection:
+            try:
+                limit_min = int(self.entry_data_start.get())
+                limit_max = int(self.entry_data_end.get())
+            except ValueError:
+                limit_min, limit_max = 0, self.total_traces
+        else:
+            limit_min, limit_max = 0, self.total_traces
+
+        limit_size = limit_max - limit_min
+
+        # 2. Определяем точку зума (якорь)
+        if anchor_trace is None:
+            anchor_trace = self._home_window_start + (self._home_window_size // 2)
+        anchor_trace = max(limit_min, min(limit_max, anchor_trace))
+
+        # 3. Рассчитываем масштаб (не даем отдалиться больше, чем размер выборки!)
         old_size = self._home_window_size
         if direction > 0:
-            new_size = max(20, int(old_size / 1.25))  # Укрупняем (меньше трасс на экране)
+            new_size = max(10, int(old_size / 1.3))  # Приближаем (уменьшаем кол-во трасс)
         else:
-            new_size = min(self.total_traces, int(old_size * 1.25))  # Отдаляем (больше трасс)
+            new_size = min(limit_size, int(old_size * 1.3))  # Отдаляем (максимум до limit_size)
+            if new_size <= old_size and old_size < limit_size:
+                new_size = min(limit_size, old_size + 20)
 
-        if new_size == old_size:
-            return
+        # 4. Центруем
+        ratio = (anchor_trace - self._home_window_start) / max(1, old_size)
+        new_start = int(anchor_trace - (new_size * ratio))
 
-        # Рассчитываем новое начало, чтобы зум шел "в центр" текущего вида
-        center = self._home_window_start + (old_size // 2)
-        new_start = max(0, min(self.total_traces - new_size, center - (new_size // 2)))
+        # 5. Жестко блокируем вылет за края "ящика"
+        if new_start < limit_min:
+            new_start = limit_min
+        if new_start + new_size > limit_max:
+            new_start = limit_max - new_size
 
         self._home_window_size = new_size
         self._request_home_window_read(int(new_start), force=True)
-
     def _home_zoom_in(self):
         self._home_zoom(1)
 
     def _home_zoom_out(self):
         self._home_zoom(-1)
+
     def _request_home_window_read(self, start: int, *, force: bool = False) -> None:
         if not self.current_file_path or self.total_traces <= 0:
             return
         window = int(self._home_window_size)
-        if window <= 0:
-            return
+        if window <= 0: return
 
-        # Если трасс >= 500 — всегда показываем ровно 500 и не "сжимаем" окно у конца файла.
-        if int(self.total_traces) >= window:
-            max_start = int(self.total_traces) - window
-            start = int(max(0, min(int(start), max_start)))
-            end = int(start + window)
+        # Логика удержания внутри границ
+        if self._home_locked_by_selection:
+            try:
+                l_min = int(self.entry_data_start.get())
+                l_max = int(self.entry_data_end.get())
+            except ValueError:
+                l_min, l_max = 0, self.total_traces
+
+            # Запираем окно в выбранном диапазоне
+            window = min(window, l_max - l_min)
+            start = max(l_min, min(start, l_max - window))
+            end = start + window
         else:
-            # Иначе показываем всё, что есть (меньше 500 физически не получить).
-            start = 0
-            end = int(self.total_traces)
-            if end <= 0:
-                return
+            if int(self.total_traces) >= window:
+                max_start = int(self.total_traces) - window
+                start = int(max(0, min(int(start), max_start)))
+                end = int(start + window)
+            else:
+                start, end = 0, int(self.total_traces)
+
         if not force and self._home_window_last == (start, end):
             return
+
         self._home_window_last = (start, end)
         self._home_window_start = int(start)
+        self._home_window_size = window
         self._home_window_target = int(start)
 
         ev = self._home_window_cancel
         if ev is not None:
             try:
                 ev.set()
-            except Exception:
+            except:
                 pass
+
         cancel_event = threading.Event()
         self._home_window_cancel = cancel_event
-
         self._home_window_request_id += 1
-        req_id = self._home_window_request_id
 
-        # Область видимости для выбора мышью — только текущее окно.
+        # Внутренние координаты (ДЛЯ ОТРИСОВКИ)
         self._home_view_start = start
         self._home_view_end = end
         self._home_view_step = 1
 
-        try:
-            self._set_entry_int(self.entry_data_start, start)
-            self._set_entry_int(self.entry_data_end, end)
-            self._set_entry_int(self.entry_data_step, 1)
-        except Exception:
-            pass
+        # ВАЖНО: ОТСЮДА УДАЛЕН БЛОК, КОТОРЫЙ МЕНЯЛ ПОЛЯ "ОТ" И "ДО". ТЕПЕРЬ ОНИ НЕПРИКОСНОВЕННЫ.
 
         try:
             if self.home_slider_status is not None:
@@ -2107,18 +2150,11 @@ class App(ctk.CTk):
 
         self._logic_queue.put(
             LogicTaskReadDataRange(
-                path=self.current_file_path,
-                request_id=req_id,
-                start=start,
-                end=end,
-                step=1,
-                chunk_size=2000,
-                max_full_matrix_bytes=256 * 1024 * 1024,
-                preview_target=int(self._home_window_size),
-                cancel_event=cancel_event,
+                path=self.current_file_path, request_id=self._home_window_request_id,
+                start=start, end=end, step=1, chunk_size=2000,
+                max_full_matrix_bytes=256 * 1024 * 1024, preview_target=window, cancel_event=cancel_event,
             )
         )
-
     def _apply_home_window_read_result(self, msg: UiMessageReadDataResult) -> None:
         try:
             if self.home_slider_status is not None:
