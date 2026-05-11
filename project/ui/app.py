@@ -890,10 +890,18 @@ class App(ctk.CTk):
         )
         self.btn_analysis_export.grid(row=0, column=2, sticky="e", padx=(0, 10), pady=6)
 
-
-
-
-
+        self.btn_clear_results = ctk.CTkButton(
+            self.analysis_taskbar,
+            text="Удалить результаты",
+            width=140,
+            height=28,
+            font=C.FONT_SMALL,
+            fg_color="#e74c3c",  # Красный цвет
+            hover_color="#c0392b",
+            text_color="white",
+            command=self._cleanup_analysis_results
+        )
+        self.btn_clear_results.grid(row=0, column=3, sticky="e", padx=(0, 10), pady=6)
         self.btn_processing_cancel = ctk.CTkButton(
             self.analysis_workspace_canvas,
             text="Отмена обработки",
@@ -1920,28 +1928,30 @@ class App(ctk.CTk):
         self._scroll_home_window(direction)
 
     def _on_home_scroll_tk(self, event) -> str:
-        """Прокрутка по тачпаду/колесу на Tk-виджете Matplotlib."""
-        if not self._is_pointer_over_home_plot():
+        if not self._is_pointer_over_home_plot() or self.total_traces <= 0:
             return "break"
-        if not self.current_file_path or self.total_traces <= 0:
-            return "break"
+
+        # Проверяем нажат ли Ctrl (маска 0x4)
+        is_ctrl = (event.state & 0x4) != 0
+
         direction = 0
-        try:
-            # Windows/macOS обычно дают event.delta, Linux может давать num=4/5.
-            delta = int(getattr(event, "delta", 0) or 0)
-            if delta > 0:
+        delta = int(getattr(event, "delta", 0) or 0)
+        if delta > 0:
+            direction = 1
+        elif delta < 0:
+            direction = -1
+        else:
+            num = int(getattr(event, "num", 0) or 0)
+            if num == 4:
                 direction = 1
-            elif delta < 0:
+            elif num == 5:
                 direction = -1
-            else:
-                num = int(getattr(event, "num", 0) or 0)
-                if num == 4:
-                    direction = 1
-                elif num == 5:
-                    direction = -1
-        except Exception:
-            direction = 0
-        self._scroll_home_window(direction)
+
+        if is_ctrl:
+            self._home_zoom(direction)  # Если зажат Ctrl — зумим
+        else:
+            self._scroll_home_window(direction)  # Если нет — скроллим
+
         return "break"
 
     def _on_global_wheel(self, event) -> Optional[str]:
@@ -2012,6 +2022,35 @@ class App(ctk.CTk):
         except Exception:
             pass
 
+
+        self._request_home_window_read(new_start, force=True)
+
+    def _home_zoom(self, direction: int) -> None:
+        if not self.current_file_path or self.total_traces <= 0:
+            return
+
+        # Считаем новый размер окна (шаг 20%)
+        old_size = self._home_window_size
+        if direction > 0:
+            new_size = max(20, int(old_size / 1.25))  # Укрупняем (меньше трасс на экране)
+        else:
+            new_size = min(self.total_traces, int(old_size * 1.25))  # Отдаляем (больше трасс)
+
+        if new_size == old_size:
+            return
+
+        # Рассчитываем новое начало, чтобы зум шел "в центр" текущего вида
+        center = self._home_window_start + (old_size // 2)
+        new_start = max(0, min(self.total_traces - new_size, center - (new_size // 2)))
+
+        self._home_window_size = new_size
+        self._request_home_window_read(int(new_start), force=True)
+
+    def _home_zoom_in(self):
+        self._home_zoom(1)
+
+    def _home_zoom_out(self):
+        self._home_zoom(-1)
     def _request_home_window_read(self, start: int, *, force: bool = False) -> None:
         if not self.current_file_path or self.total_traces <= 0:
             return
@@ -2623,63 +2662,68 @@ class App(ctk.CTk):
 
         top_controls = ctk.CTkFrame(outer, fg_color="transparent")
         top_controls.grid(row=0, column=0, sticky="ew", padx=2, pady=(0, 6))
+
         ctk.CTkLabel(top_controls, text="Амплитуда", font=C.FONT_SMALL, text_color=C.GRAY_TEXT).pack(
             side="left", padx=(4, 4)
         )
+
         self._home_amp_slider = ctk.CTkSlider(
-            top_controls,
-            from_=0.1,
-            to=3.0,
-            number_of_steps=58,
-            width=180,
+            top_controls, from_=0.1, to=3.0, number_of_steps=58, width=180,
             command=self._on_home_amp_slider,
         )
         self._home_amp_slider.set(1.0)
         self._home_amp_slider.pack(side="left", padx=(0, 6))
+
         self._home_amp_var = tk.StringVar(value="1.00")
         self._home_amp_entry = ctk.CTkEntry(top_controls, width=64, textvariable=self._home_amp_var)
         self._home_amp_entry.pack(side="left", padx=(0, 10))
         self._home_amp_entry.bind("<Return>", self._on_home_amp_entry_commit)
         self._home_amp_entry.bind("<FocusOut>", self._on_home_amp_entry_commit)
+
         self._home_btn_clear_selection = ctk.CTkButton(
-            top_controls,
-            text="Снять выбор",
-            width=130,
-            height=30,
-            font=C.FONT_SMALL,
+            top_controls, text="Снять выбор", width=130, height=30, font=C.FONT_SMALL,
             command=self._clear_home_selection_lock,
         )
         self._home_btn_clear_selection.pack(side="right", padx=(8, 4))
 
         def pane(row: int, col: int, title: str, pad_l: int, pad_r: int) -> ctk.CTkFrame:
             box = ctk.CTkFrame(
-                outer,
-                fg_color=C.PIPELINE_CARD_FG,
-                corner_radius=C.RIBBON_CORNER_RADIUS,
-                border_width=2,
-                border_color=C.ACCENT_ON_BORDER,
+                outer, fg_color=C.PIPELINE_CARD_FG, corner_radius=C.RIBBON_CORNER_RADIUS,
+                border_width=2, border_color=C.ACCENT_ON_BORDER,
             )
             box.grid(row=row, column=col, sticky="nsew", padx=(pad_l, pad_r), pady=(0, 2))
             box.grid_rowconfigure(1, weight=1)
             box.grid_columnconfigure(0, weight=1)
             ctk.CTkLabel(
-                box,
-                text=title,
-                font=C.FONT_HEAD,
-                text_color=C.GRAY_TEXT,
-                anchor="w",
+                box, text=title, font=C.FONT_HEAD, text_color=C.GRAY_TEXT, anchor="w",
             ).grid(row=0, column=0, sticky="ew", padx=14, pady=(12, 6))
             host = ctk.CTkFrame(
-                box,
-                fg_color=C.ANALYSIS_WORKSPACE_INNER,
-                corner_radius=8,
-                border_width=1,
-                border_color=C.ANALYSIS_WORKSPACE_BORDER,
+                box, fg_color=C.ANALYSIS_WORKSPACE_INNER, corner_radius=8,
+                border_width=1, border_color=C.ANALYSIS_WORKSPACE_BORDER,
             )
             host.grid(row=1, column=0, sticky="nsew", padx=12, pady=(0, 12))
             return host
 
+        # ВАЖНО: Сначала создаем host, чтобы переменная получила значение
         self._home_plot_host_before = pane(1, 0, "Исходные данные", 0, 0)
+
+        # ТЕПЕРЬ добавляем кнопки (теперь переменная self._home_plot_host_before уже существует)
+        self.zoom_ctrl_frame = ctk.CTkFrame(self._home_plot_host_before.master, fg_color="transparent")
+        self.zoom_ctrl_frame.place(relx=1.0, rely=0.0, anchor="ne", x=-15, y=10)
+
+        self.btn_z_in = ctk.CTkButton(
+            self.zoom_ctrl_frame, text="🔍+", width=34, height=34, corner_radius=6,
+            fg_color=C.ACCENT, hover_color=C.ACCENT_DARK, command=self._home_zoom_in
+        )
+        self.btn_z_in.pack(side="left", padx=2)
+
+        self.btn_z_out = ctk.CTkButton(
+            self.zoom_ctrl_frame, text="🔍-", width=34, height=34, corner_radius=6,
+            fg_color=C.ACCENT, hover_color=C.ACCENT_DARK, command=self._home_zoom_out
+        )
+        self.btn_z_out.pack(side="left", padx=2)
+
+        # Дальше идет твой блок с Matplotlib
         self._home_matplotlib_ok = False
         self._home_fig_before = None
         self._home_ax_before = None
@@ -2752,6 +2796,29 @@ class App(ctk.CTk):
             color="#555555",
         )
 
+    @staticmethod
+    def _cleanup_analysis_results(self) -> None:
+        """Безопасная очистка графиков и памяти без удаления виджетов."""
+        # Закрываем окна "До" и "После"
+        for key in ["before", "after"]:
+            popup = self._plot_popups.get(key)
+            if popup:
+                try:
+                    popup.destroy()
+                except:
+                    pass
+            self._plot_popups[key] = None
+
+        # Очищаем таблицу и память
+        self.analysis_table.delete(*self.analysis_table.get_children())
+        self._analysis_export_source = None
+
+        # Сбрасываем статус, НО НЕ УДАЛЯЕМ ЛЕЙБЛ
+        self.analysis_status_label.configure(text="Результаты очищены.", text_color=C.GRAY_TEXT)
+        self.analysis_progress.set(0.0)
+
+        # Снимаем выделение на графике
+        self._clear_home_selection_lock()
     def _reset_home_plots_empty(self) -> None:
         if not getattr(self, "_home_matplotlib_ok", False):
             return
@@ -2806,47 +2873,58 @@ class App(ctk.CTk):
         state_snapshot = {
             "pipeline": self.analysis_pipeline[:],
             "file_path": self.current_file_path,
+            "selected_ranges": self._home_selected_ranges[:],
         }
         self._undo_stack.append(state_snapshot)
         if len(self._undo_stack) > 30:
             self._undo_stack.pop(0)
 
     def _undo(self, event=None) -> None:
-        
         if not self._undo_stack:
             self.status_hint_label.configure(text="История правок пуста")
             return
-        
+
         last_state = self._undo_stack.pop()
-        
-        
+
+        # Восстанавливаем путь к файлу
         self.current_file_path = last_state["file_path"]
         if self.current_file_path:
             name = os.path.basename(self.current_file_path)
             self.file_status.configure(text=f"Восстановлен: {name}", text_color=C.STATUS_OK)
+            # Если файл вернули, надо его заново провалидировать (как при загрузке)
+            self.submit_load_seismic(self.current_file_path)
         else:
             self.file_status.configure(text="Файл не выбран", text_color="gray")
-            
-      
+            self._reset_home_plots_empty()
+
+        # Восстанавливаем методы
         self.analysis_pipeline = last_state["pipeline"]
         self._refresh_analysis_ui()
-        self.status_hint_label.configure(text="Действие отменено (Ctrl+Z)")
 
+        self.status_hint_label.configure(text="Действие отменено (Ctrl+Z)")
     def clear_all_data(self) -> None:
-        
         if not self.current_file_path and not self.analysis_pipeline:
             return
 
         if messagebox.askyesno("Очистка", "Удалить выбранный файл и цепочку обработки?", parent=self):
-            self._save_undo_state()
+            self._save_undo_state()  # Сохраняем перед удалением, чтобы можно было нажать Ctrl+Z!
+
+            # Сбрасываем данные
             self.current_file_path = None
             self.file_status.configure(text="Файл не выбран", text_color="gray")
+            self.analysis_pipeline = []
+
+            # Сбрасываем внутреннее состояние
             self._reset_data_tab_state()
             self._reset_home_plots_empty()
-            self.analysis_pipeline = []
             self._refresh_analysis_ui()
-            for child in self.analysis_workspace_canvas.winfo_children():
-                child.destroy()
+
+            # ВАЖНО: Вместо destroy() просто чистим содержимое
+            self.analysis_status_label.configure(text="Выберите порядок методов и нажмите «Обработка».",
+                                                 text_color=C.GRAY_TEXT)
+            self.analysis_progress.set(0.0)
+            self.analysis_table.delete(*self.analysis_table.get_children())
+            self._analysis_export_source = None
     def save_state(self, tab: str) -> None:
         
         if self.is_navigating:
