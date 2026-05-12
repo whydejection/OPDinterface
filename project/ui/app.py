@@ -114,6 +114,12 @@ class App(ctk.CTk):
         self._data_range_cache: dict[tuple[str, int, int, int, int], dict[str, Any]] = {}
         self._process_request_id: int = 0
         self._process_cancel: Optional[threading.Event] = None
+        # Кэш для плавного скролла
+        self._scroll_matrix_cache: Optional[Any] = None      # полная загруженная матрица (буфер)
+        self._scroll_cache_start: int = 0                     # абсолютный старт буфера
+        self._scroll_cache_end: int = 0                       # абсолютный конец буфера
+        self._scroll_pending_start: Optional[int] = None      # куда запрошена следующая загрузка
+        self._scroll_accum: float = 0.0                       # аккумулятор дельты тачпада
 
         self._shutdown = False
         self._ui_poll_id: Optional[str] = None
@@ -294,7 +300,7 @@ class App(ctk.CTk):
             if r.ok and r.name:
                 self.current_file_path = r.path
                 self.file_status.configure(
-                    text=f"Успешно загружен: {r.name}",
+                    text=f"Успешно загружен: {r.name}\nКоличество трасс: {r.tracecount}\nКоличество строк: {r.samples_count}",
                     text_color=C.STATUS_OK,
                 )
                 self.total_traces = int(r.tracecount or 0)
@@ -925,22 +931,7 @@ class App(ctk.CTk):
         table_frame.grid_rowconfigure(0, weight=1)
         table_frame.grid_columnconfigure(0, weight=1)
 
-        self.analysis_table = ttk.Treeview(
-            table_frame,
-            columns=("Время",),
-            show="headings",
-            selectmode="browse"
-        )
-
-
-        v_scroll = ttk.Scrollbar(table_frame, orient="vertical", command=self.analysis_table.yview)
-        h_scroll = ttk.Scrollbar(table_frame, orient="horizontal", command=self.analysis_table.xview)
-        self.analysis_table.configure(yscrollcommand=v_scroll.set, xscrollcommand=h_scroll.set)
-
-        # Теперь таблица и скроллбары плотно прилегают к краям и тянутся
-        self.analysis_table.grid(row=0, column=0, sticky="nsew")
-        v_scroll.grid(row=0, column=1, sticky="ns")
-        h_scroll.grid(row=1, column=0, sticky="ew")
+        
 
         # Чистый стиль: белый фон, черные границы и текст
         style = ttk.Style()
@@ -970,19 +961,24 @@ class App(ctk.CTk):
         self.traces_caption.grid(row=0, column=0, sticky="e", padx=50, pady=(5, 0))
 
         # Только таблица, без лишних элементов
+        # Оставляем только это — единственное создание таблицы:
         self.analysis_table = ttk.Treeview(table_frame, selectmode="browse")
         self.analysis_table.grid(row=0, column=0, sticky="nsew")
 
         self.analysis_v_scroll = ttk.Scrollbar(table_frame, orient="vertical", command=self.analysis_table.yview)
-        self.analysis_v_scroll.grid(row=0, column=1, sticky="ns")  # ВОТ ЭТА СТРОКА (516)
+        self.analysis_v_scroll.grid(row=0, column=1, sticky="ns")
         self.analysis_table.configure(yscrollcommand=self.analysis_v_scroll.set)
 
         self.analysis_h_scroll = ttk.Scrollbar(table_frame, orient="horizontal", command=self.analysis_table.xview)
         self.analysis_h_scroll.grid(row=1, column=0, sticky="ew")
         self.analysis_table.configure(xscrollcommand=self.analysis_h_scroll.set)
-        table_frame.grid_rowconfigure(1, weight=1)
-        table_frame.grid_columnconfigure(0, weight=1)
 
+        # ВАЖНО: строки должны быть в правильном порядке — сначала row=0 с weight=1,
+        # затем row=1 (скроллбар). Исправьте порядок grid_rowconfigure:
+        table_frame.grid_rowconfigure(0, weight=1)
+        table_frame.grid_rowconfigure(1, weight=0)   # горизонтальный скроллбар не растягивается
+        table_frame.grid_columnconfigure(0, weight=1)
+        table_frame.grid_columnconfigure(1, weight=0)
 
         self._refresh_analysis_ui()
 
@@ -1931,38 +1927,37 @@ class App(ctk.CTk):
         if not self._is_pointer_over_home_plot() or self.total_traces <= 0:
             return "break"
 
-        # 1. Проверяем зажат ли Ctrl (0x4 — стандарт для Windows/Linux)
         is_ctrl = (event.state & 0x4) != 0
 
-        # 2. Определяем направление (колесико вверх/вниз)
-        direction = 0
-        if event.delta > 0 or event.num == 4:
-            direction = 1  # Вперед/Вверх
-        elif event.delta < 0 or event.num == 5:
-            direction = -1  # Назад/Вниз
+        # Аккумулируем дельту тачпада — он шлёт много событий с delta=1..3
+        delta = getattr(event, "delta", 0)
+        if delta == 0:
+            delta = 120 if event.num == 4 else -120
 
-        if direction == 0:
+        if not hasattr(self, "_scroll_accum"):
+            self._scroll_accum = 0
+        self._scroll_accum += delta
+
+        # Порог срабатывания: 60 вместо 120 — в два раза чувствительнее
+        threshold = 60
+        if abs(self._scroll_accum) < threshold:
             return "break"
 
+        direction = 1 if self._scroll_accum > 0 else -1
+        self._scroll_accum = 0  # сбрасываем после срабатывания
+
         if is_ctrl:
-            # ЗУМ В КУРСОР
             try:
                 canvas_widget = self._home_canvas_before.get_tk_widget()
-                # Координата X внутри виджета
                 lx = event.x
-                # Инвертируем Y (в Tkinter 0 сверху, в Matplotlib 0 снизу)
                 ly = canvas_widget.winfo_height() - event.y
-
-                # Переводим пиксели в номер трассы
                 inv = self._home_ax_before.transData.inverted()
                 data_coords = inv.transform((lx, ly))
                 anchor = self._home_trace_from_x(data_coords[0])
             except Exception:
-                anchor = None  # Если не вышло, зумим в центр экрана
-
+                anchor = None
             self._home_zoom(direction, anchor_trace=anchor)
         else:
-            # ОБЫЧНЫЙ СКРОЛЛ (тоже должен уважать границы)
             self._scroll_home_window(direction)
 
         return "break"
@@ -2000,34 +1995,87 @@ class App(ctk.CTk):
         if direction == 0 or not self.current_file_path or self.total_traces <= 0:
             return
 
-        step = max(5, self._home_window_size // 10)
-        base = int(self._home_window_target if self._home_window_target is not None else self._home_window_start)
-        start = base - direction * step
+        step = max(10, self._home_window_size // 50)
+        base = int(self._home_window_target if self._home_window_target is not None
+                   else self._home_window_start)
+        new_start = base - direction * step
 
-        # Скроллим только внутри разрешенного ящика
+        # Зажимаем в допустимые границы
         if self._home_locked_by_selection:
             try:
                 l_min = int(self.entry_data_start.get())
                 l_max = int(self.entry_data_end.get())
             except ValueError:
                 l_min, l_max = 0, self.total_traces
-
-            # Блокируем сдвиг влево/вправо за границы От и До
-            start = max(l_min, min(start, l_max - self._home_window_size))
+            new_start = max(l_min, min(new_start, l_max - self._home_window_size))
         else:
-            max_start = max(0, int(self.total_traces) - int(self._home_window_size))
-            start = max(0, min(max_start, start))
+            max_start = max(0, self.total_traces - self._home_window_size)
+            new_start = max(0, min(max_start, new_start))
 
-        self._home_window_target = start
+        self._home_window_target = new_start
+
+        # --- МГНОВЕННАЯ ОТРИСОВКА из кэша если данные уже есть ---
+        new_end = new_start + self._home_window_size
+        if (self._scroll_matrix_cache is not None
+                and self._scroll_cache_start <= new_start
+                and new_end <= self._scroll_cache_end):
+            self._render_window_from_cache(new_start, new_end)
+        # ---------------------------------------------------------
+
+        # Фоновая подгрузка расширенного буфера (3× окна)
         if self._home_window_after is not None:
             try:
                 self.after_cancel(self._home_window_after)
-            except:
+            except Exception:
                 pass
-            self._home_window_after = None
+        self._home_window_after = self.after(
+            80, lambda s=new_start: self._request_home_window_read(s)
+        )
 
-        self._home_window_after = self.after(20, lambda: self._request_home_window_read(start))
+    def _render_window_from_cache(self, start: int, end: int) -> None:
+        """Мгновенно нарезает нужный срез из кэш-матрицы и рисует без I/O."""
+        if not getattr(self, "_home_matplotlib_ok", False):
+            return
+        import numpy as np
+        arr = np.asarray(self._scroll_matrix_cache, dtype=np.float32)
+        # Вырезаем нужный диапазон из буфера
+        local_start = start - self._scroll_cache_start
+        local_end = end - self._scroll_cache_start
+        local_start = max(0, local_start)
+        local_end = min(arr.shape[0], local_end)
+        if local_end <= local_start:
+            return
 
+        window_slice = arr[local_start:local_end, :]
+
+        # Обновляем внутренние координаты вида
+        self._home_view_start = start
+        self._home_view_end = end
+        self._home_window_start = start
+        self._home_window_target = start
+
+        # Рисуем напрямую — без запроса к воркеру
+        axb = self._home_ax_before
+        axb.clear()
+        axb.axis("on")
+        self._plot_matrix_on_ax(
+            axb, window_slice, start, 1,
+            key="before", normalized=False
+        )
+        axb.set_xlabel("Номер трассы")
+        axb.set_ylabel("Время / отсчёт")
+        axb.tick_params(labelsize=8)
+        self._home_fig_before.subplots_adjust(
+            left=0.08, right=0.96, top=0.95, bottom=0.13
+        )
+        # draw_idle() — неблокирующий, не ждёт завершения рендера
+        self._home_canvas_before.draw_idle()
+
+        # Обновляем оверлей выделения
+        try:
+            self._draw_home_selection_overlay(start, end)
+        except Exception:
+            pass
     def _clear_home_selection_lock(self) -> None:
         """Снять выбор диапазона и вернуть прокрутку окна 500 трасс."""
         self._home_locked_by_selection = False
@@ -2094,89 +2142,138 @@ class App(ctk.CTk):
         if not self.current_file_path or self.total_traces <= 0:
             return
         window = int(self._home_window_size)
-        if window <= 0: return
+        if window <= 0:
+            return
 
-        # Логика удержания внутри границ
+        # Загружаем буфер в 3× шире окна для плавного скролла
+        buffer_size = window * 3
+        # Инициализируем заранее, чтобы переменные были определены при любом пути выполнения
+        buf_start = 0
+        buf_end = 0
+        view_end = start + window
+
         if self._home_locked_by_selection:
             try:
                 l_min = int(self.entry_data_start.get())
                 l_max = int(self.entry_data_end.get())
             except ValueError:
                 l_min, l_max = 0, self.total_traces
-
-            # Запираем окно в выбранном диапазоне
-            window = min(window, l_max - l_min)
-            start = max(l_min, min(start, l_max - window))
-            end = start + window
+            buffer_size = min(buffer_size, l_max - l_min)
+            buf_start = max(l_min, start - window)
+            buf_start = min(buf_start, l_max - buffer_size)
+            buf_end = buf_start + buffer_size
         else:
-            if int(self.total_traces) >= window:
-                max_start = int(self.total_traces) - window
-                start = int(max(0, min(int(start), max_start)))
-                end = int(start + window)
-            else:
-                start, end = 0, int(self.total_traces)
+            buf_start = max(0, start - window)
+            buf_start = min(buf_start, max(0, self.total_traces - buffer_size))
+            buf_end = min(self.total_traces, buf_start + buffer_size)
 
-        if not force and self._home_window_last == (start, end):
+        # Если буфер уже покрывает запрошенный диапазон — только рисуем
+        view_end = start + window
+        if (not force
+                and self._scroll_matrix_cache is not None
+                and self._scroll_cache_start <= start
+                and view_end <= self._scroll_cache_end):
+            self._render_window_from_cache(start, view_end)
+            # Подгружаем расширение буфера тихо в фоне если край близко
+            margin = window // 2
+            needs_prefetch = (
+                start - self._scroll_cache_start < margin
+                or self._scroll_cache_end - view_end < margin
+            )
+            if not needs_prefetch:
+                return
+            # иначе — продолжаем и запрашиваем расширенный буфер
+
+        if not force and self._home_window_last == (buf_start, buf_end):
             return
 
-        self._home_window_last = (start, end)
-        self._home_window_start = int(start)
-        self._home_window_size = window
-        self._home_window_target = int(start)
+        self._home_window_last = (buf_start, buf_end)
+        self._home_window_start = start
+        self._home_window_target = start
+        self._home_view_start = start
+        self._home_view_end = view_end
+        self._home_view_step = 1
 
         ev = self._home_window_cancel
         if ev is not None:
             try:
                 ev.set()
-            except:
+            except Exception:
                 pass
 
         cancel_event = threading.Event()
         self._home_window_cancel = cancel_event
         self._home_window_request_id += 1
 
-        # Внутренние координаты (ДЛЯ ОТРИСОВКИ)
-        self._home_view_start = start
-        self._home_view_end = end
-        self._home_view_step = 1
-
-        # ВАЖНО: ОТСЮДА УДАЛЕН БЛОК, КОТОРЫЙ МЕНЯЛ ПОЛЯ "ОТ" И "ДО". ТЕПЕРЬ ОНИ НЕПРИКОСНОВЕННЫ.
-
         try:
             if self.home_slider_status is not None:
-                self.home_slider_status.configure(text="Чтение окна: 0%")
+                self.home_slider_status.configure(text="")
         except Exception:
             pass
 
         self._logic_queue.put(
             LogicTaskReadDataRange(
-                path=self.current_file_path, request_id=self._home_window_request_id,
-                start=start, end=end, step=1, chunk_size=2000,
-                max_full_matrix_bytes=256 * 1024 * 1024, preview_target=window, cancel_event=cancel_event,
+                path=self.current_file_path,
+                request_id=self._home_window_request_id,
+                start=buf_start,
+                end=buf_end,
+                step=1,
+                chunk_size=2000,
+                max_full_matrix_bytes=256 * 1024 * 1024,
+                preview_target=buffer_size,
+                cancel_event=cancel_event,
             )
         )
+
+        
     def _apply_home_window_read_result(self, msg: UiMessageReadDataResult) -> None:
         try:
             if self.home_slider_status is not None:
                 self.home_slider_status.configure(text="")
         except Exception:
             pass
-        self._home_view_start = int(msg.start)
-        self._home_view_end = int(msg.end)
-        self._home_view_step = int(max(1, msg.step))
-        self._home_window_start = int(msg.start)
-        self._home_window_target = int(msg.start)
 
-        use_full = bool(msg.keep_full_matrix and msg.full_matrix is not None)
-        plot_matrix = msg.full_matrix if use_full else msg.preview_matrix_norm
-        if plot_matrix is None:
-            return
-        self._update_home_before_from_matrix(plot_matrix, normalized=(not use_full))
+        # Сохраняем полный буфер в кэш для мгновенного скролла
+        raw = msg.full_matrix if (msg.keep_full_matrix and msg.full_matrix is not None) \
+              else msg.preview_matrix
+        if raw is not None:
+            import numpy as np
+            self._scroll_matrix_cache = np.asarray(raw, dtype=np.float32)
+            self._scroll_cache_start = int(msg.start)
+            self._scroll_cache_end = int(msg.end)
+
+        # Рендерим нужное окно из только что загруженного буфера
+        view_start = self._home_window_start
+        view_end = view_start + self._home_window_size
+        view_end = min(view_end, int(msg.end))
+
+        if (self._scroll_matrix_cache is not None
+                and self._scroll_cache_start <= view_start
+                and view_end <= self._scroll_cache_end):
+            self._home_view_start = view_start
+            self._home_view_end = view_end
+            self._home_view_step = 1
+            self._render_window_from_cache(view_start, view_end)
+        else:
+            # Фолбэк на старое поведение
+            self._home_view_start = int(msg.start)
+            self._home_view_end = int(msg.end)
+            self._home_view_step = int(max(1, msg.step))
+            self._home_window_start = int(msg.start)
+            self._home_window_target = int(msg.start)
+            use_full = bool(msg.keep_full_matrix and msg.full_matrix is not None)
+            plot_matrix = msg.full_matrix if use_full else msg.preview_matrix_norm
+            if plot_matrix is None:
+                return
+            self._update_home_before_from_matrix(plot_matrix, normalized=(not use_full))
+
         try:
-            self._draw_home_selection_overlay(int(msg.start), int(msg.end))
+            self._draw_home_selection_overlay(
+                self._home_view_start, self._home_view_end
+            )
         except Exception:
             pass
-
+        
     def _on_data_read_to_memory(self) -> None:
         if not self.current_file_path or self.total_traces <= 0:
             return
@@ -2832,7 +2929,6 @@ class App(ctk.CTk):
             color="#555555",
         )
 
-    @staticmethod
     def _cleanup_analysis_results(self) -> None:
         """Безопасная очистка графиков и памяти без удаления виджетов."""
         # Закрываем окна "До" и "После"
